@@ -84,7 +84,10 @@ def trace_path(scene, spheres, triangles, bvh, ray, bounce):
         elif nearest_object_material.type==MatType.SPECULAR.value:
             # specular reflection (only dielectric materials)
             new_ray_direction, pdf_fwd, brdf, intr_type = sample_specular(nearest_object_material, surface_normal, ray)
-            throughput = throughput * brdf / pdf_fwd # update throughput
+
+            if pdf_fwd!=0:
+                throughput = throughput * brdf / pdf_fwd # update throughput
+
             # if intr_type==Medium.REFRACTION.value:
             #     intersection = intersection+(-EPSILON)*new_ray_direction
             # else:
