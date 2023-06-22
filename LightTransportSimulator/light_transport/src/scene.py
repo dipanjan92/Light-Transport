@@ -1,22 +1,70 @@
 import numpy as np
 import numba
+
+from .constants import EPSILON, ZEROS
 from .material import Material
 from .primitives import Sphere
-from .vectors import normalize
+from .rays import Ray
+from .utils import hit_object, get_cosine_hemisphere_pdf, sample_cosine_hemisphere, cosine_weighted_hemisphere_sampling
+from .vectors import normalize, find_length, length_squared
 
 
 @numba.experimental.jitclass([
     ('source', numba.float64[:]),
+    ('radius', numba.float64),
     ('material', Material.class_type.instance_type),
     ('normal', numba.float64[:]),
     ('total_area', numba.float64)
 ])
 class Light:
-    def __init__(self, source, material, normal, total_area):
+    def __init__(self, source, radius, material, normal, total_area):
         self.source = source
+        self.radius = radius
         self.material = material
         self.normal = normal
         self.total_area = total_area
+
+    def sample_incident(self, ref_isec, spheres, triangles, bvh):
+        new_path_direction = normalize(self.source - ref_isec.intersected_point)
+        new_path = Ray(ref_isec.intersected_point, new_path_direction, EPSILON)
+        new_path_magnitude = find_length(self.source - ref_isec.intersected_point)
+
+        isec = hit_object(spheres, triangles, bvh, new_path)
+        visible = isec.min_distance is None or isec.min_distance > new_path_magnitude
+
+        Li = 0
+        pdf = 0
+
+        light_pdf = 1/self.total_area
+
+        if light_pdf==0 or length_squared(self.source - ref_isec.intersected_point)==0:
+            return Li, new_path, 0, visible
+
+        if np.dot(self.normal, -new_path_direction)>0:
+            Li = self.material.emission
+        else:
+            Li = 0
+
+        return Li, new_path, pdf, visible
+
+    def get_pdf(self, r, isec_n):
+        pdf_pos = 1/self.total_area
+        pdf_dir = get_cosine_hemisphere_pdf(np.dot(isec_n, r.direction))
+        return pdf_pos, pdf_dir
+
+    def sample_source(self):
+        pdf_pos = 1/self.total_area
+        outgoing_direction, pdf_dir = cosine_weighted_hemisphere_sampling(self.normal, None)
+
+        light_ray = Ray(self.source, outgoing_direction, 0)
+
+        if np.dot(self.normal, outgoing_direction)>0:
+            Le = self.material.emission
+        else:
+            Le = 0
+
+        return Le, light_ray, pdf_pos, pdf_dir
+
 
 
 @numba.experimental.jitclass([
@@ -37,6 +85,41 @@ class Camera:
         self.focal_length = None
         self.normal = None
         self.screen_area = None
+
+    def get_importance(self, new_path):
+        cos_theta = np.dot(new_path.direction, self.normal)
+        if cos_theta<=0:
+            return 0
+        lens_area = 1
+        cos2_theta = cos_theta**2
+        Wi = 1 / (self.screen_area * 1 * cos2_theta * cos2_theta)
+        return Wi
+
+    def sample_incident(self, ref_isec, spheres, triangles, bvh):
+        new_path_direction = normalize(self.position - ref_isec.intersected_point)
+        new_path = Ray(ref_isec.intersected_point, new_path_direction, EPSILON)
+        new_path_magnitude = find_length(self.position - ref_isec.intersected_point)
+
+        isec = hit_object(spheres, triangles, bvh, new_path)
+        visible = isec.min_distance is None or isec.min_distance > new_path_magnitude
+
+        Wi =0
+        pdf = 0
+
+        if visible:
+            pdf = (new_path_magnitude**2) / (np.abs(np.dot(self.normal, new_path_direction)) * 1) # lens_area = 1
+            Wi = self.get_importance(new_path)
+
+        return Wi, new_path, pdf, visible
+
+    def get_pdf(self, r):
+        cos_theta = np.dot(r.direction, self.normal)
+        if cos_theta<=0:
+            return 0, 0
+        lens_area = 1
+        pdf_pos = 1/lens_area
+        pdf_dir = 1/(self.screen_area*(cos_theta**3))
+        return pdf_pos, pdf_dir
 
 
 def generate_custom_camera(width, height, fov):

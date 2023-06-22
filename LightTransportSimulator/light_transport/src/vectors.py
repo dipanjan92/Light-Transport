@@ -10,6 +10,16 @@ def normalize(vector):
     return vector/norm
 
 
+@numba.njit
+def length_squared(vector):
+    return np.dot(vector, vector)
+
+
+@numba.njit
+def find_length(vector):
+    return np.linalg.norm(vector)
+
+
 def unit_vector(vector):
     """
     :param vector: Any vector as numpy array

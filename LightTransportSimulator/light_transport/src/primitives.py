@@ -326,8 +326,7 @@ class PreComputedTriangle:
 # triangle_type = numba.deferred_type()
 
 spec = [
-    ('nearest_sphere', numba.optional(Sphere.class_type.instance_type)),
-    ('nearest_triangle', numba.optional(Triangle.class_type.instance_type)),
+    ('material', numba.optional(Material.class_type.instance_type)),
     ('min_distance', numba.optional(numba.float64)),
     ('intersected_point', numba.optional(numba.float64[:])),
     ('normal', numba.float64[:])
@@ -335,9 +334,8 @@ spec = [
 
 @numba.experimental.jitclass(spec)
 class Intersection:
-    def __init__(self, nearest_triangle, nearest_sphere, min_distance, intersected_point, normal):
-        self.nearest_triangle = nearest_triangle
-        self.nearest_sphere = nearest_sphere
+    def __init__(self, material, min_distance, intersected_point, normal):
+        self.material = material
         self.min_distance = min_distance
         self.intersected_point = intersected_point
         self.normal = normal

@@ -50,11 +50,8 @@ def cast_one_shadow_ray(scene, spheres, triangles, bvh, intersected_object_mater
     if min_distance is None:
         return light_contrib # black background- unlikely
 
-    nearest_triangle = isect.nearest_triangle
-    nearest_sphere = isect.nearest_sphere
-
     # visible = min_distance >= shadow_ray_magnitude-EPSILON
-    visible = nearest_triangle is None and nearest_sphere.material.emission>0
+    visible = isect.material.emission>0
     if visible:
         brdf = (light.material.emission * light.material.color.diffuse) * (intersected_object_material.color.diffuse * inv_pi)
         cos_theta = np.dot(intersection_normal, shadow_ray_direction)
@@ -66,67 +63,33 @@ def cast_one_shadow_ray(scene, spheres, triangles, bvh, intersected_object_mater
     return light_contrib
 
 
-# def cosine_weighted_light_sampling(normal_at_intersection):
-#     # random uniform samples
-#     r1 = np.random.rand()
-#     r2 = np.random.rand()
-#
-#     phi = 2*np.pi*r2
-#     theta = np.arccos(np.sqrt(r1))
-#     cos_theta = np.cos(theta)
-#
-#     random_point = np.array([np.sin(theta)*np.cos(phi), np.sin(theta)*np.sin(phi), cos_theta], dtype=np.float64)
-#
-#     v2, v3 = create_orthonormal_system(normal_at_intersection)
-#
-#     outgoing_direction = np.array([random_point[0] * v2[0] + random_point[1] * v3[0] + random_point[2] * normal_at_intersection[0],
-#                                    random_point[0] * v2[1] + random_point[1] * v3[1] + random_point[2] * normal_at_intersection[1],
-#                                    random_point[0] * v2[2] + random_point[1] * v3[2] + random_point[2] * normal_at_intersection[2],
-#                                    0], dtype=np.float64)
-#
-#
-#     pdf = np.abs(cos_theta)*inv_pi
-#
-#     return outgoing_direction, pdf
-
-
 
 @numba.njit
-def sample_light(scene, rand):
+def sample_light(scene):
     random_light_index = np.random.choice(len(scene.lights), 1)[0]
     light = scene.lights[random_light_index]
 
     # generate a random ray and compute its pdf
-    u = np.array(rand, dtype=np.float64)
-    light_ray_direction = sample_cosine_hemisphere(u) # in local coordinates
-    v2, v3 = create_orthonormal_system(light.normal) # for coordinates transformation
-    light_ray_direction = np.array([light_ray_direction[0] * v2[0] + light_ray_direction[1] * v3[0] + light_ray_direction[2] * light.normal[0],
-                                    light_ray_direction[0] * v2[1] + light_ray_direction[1] * v3[1] + light_ray_direction[2] * light.normal[1],
-                                    light_ray_direction[0] * v2[2] + light_ray_direction[1] * v3[2] + light_ray_direction[2] * light.normal[2],
-                                   0], dtype=np.float64) # global coordinates
+    direction, origin, pdf_dir = sample_light_direction(light.source)
 
-    pdf_dir = get_cosine_hemisphere_pdf(np.abs(light_ray_direction[2])) # directional pdf of sampled light
-
-    light_ray_origin = light.source + EPSILON * light_ray_direction
-
-    light_ray_magnitude = np.linalg.norm(light_ray_direction)
-
-    light_ray = Ray(light_ray_origin, light_ray_direction)
+    light_ray = Ray(origin, direction, 0)
 
     light_pdf = 1 # 1/no_of_lights
     pdf_pos = 1/light.total_area
 
     # create light vertex
-    light_vertex = create_light_vertex(light, light_ray_direction, light_ray_magnitude, pdf_dir, pdf_pos*light_pdf)
-
-    light_vertex.color = light.material.color.diffuse
+    light_vertex = create_light_vertex(light, light_ray, pdf_pos*light_pdf)
 
     if np.dot(light.normal, light_ray.direction)>0:
-        light_vertex.throughput = light.material.emission
+        light_vertex.throughput = light.material.emission*light.material.color.diffuse
     else:
-        light_vertex.throughput = 0
+        light_vertex.throughput = ZEROS
 
-    throughput = (light_vertex.throughput*np.abs(np.dot(light_vertex.g_norm, light_ray.direction)))/(light_pdf*light_vertex.pdf_pos*light_vertex.pdf_dir)
+    throughput = (light_vertex.throughput*np.abs(np.dot(light_vertex.isec.normal, light_ray.direction)))/(light_pdf*light_vertex.pdf_pos*light_vertex.pdf_dir)
+
+    light_vertex.throughput = throughput
+    light_vertex.pdf_pos = pdf_pos
+    light_vertex.pdf_dir = pdf_dir
 
     return light_ray, light_vertex, throughput
 
@@ -145,7 +108,7 @@ def cast_all_shadow_rays(scene, bvh, intersected_object, intersection_point, int
         if min_distance is None:
             break
 
-        visible = min_distance >= shadow_ray_magnitude
+        visible = min_distance > shadow_ray_magnitude
         if visible:
             brdf = (light.material.emission * light.material.color.diffuse) * (intersected_object.material.color.diffuse * inv_pi)
             cos_theta = np.dot(intersection_normal, shadow_ray_direction)
@@ -156,5 +119,49 @@ def cast_all_shadow_rays(scene, bvh, intersected_object, intersection_point, int
     light_contrib = light_contrib/len(scene.lights)
 
     return light_contrib
+
+
+@numba.njit
+def sample_point_on_light(light_source):
+    # Assume the disk light source is represented by a sphere object
+    # with only the disk part visible as the light source within the Cornell Box.
+
+    # Sample a random point on the disk surface
+    u, v = np.random.uniform(size=2)
+    theta = 2 * np.pi * u
+    radius = light_source.radius
+    position = light_source.source + radius * np.array([np.cos(theta), np.sin(theta), 0.0])
+
+    # Calculate the surface normal of the disk (aligned with the z-axis in this case)
+    normal = light_source.normal #np.array([0.0, 0.0, 1.0])
+
+    # Calculate the probability density function (PDF) for sampling the point on the disk
+    pdf = 1.0 / light_source.total_area
+
+    return position, normal, pdf
+
+
+@numba.njit
+def sample_light_direction(light_point):
+    # Assume the disk light source emits light uniformly in all directions.
+
+    # Sample a random direction on the unit hemisphere
+    u, v = np.random.random(size=2)
+    theta = 2 * np.pi * u
+    phi = np.arccos(2 * v - 1)
+
+    # Calculate the direction vector
+    direction = np.array([
+        np.sin(phi) * np.cos(theta),
+        np.sin(phi) * np.sin(theta),
+        np.cos(phi)
+    ])
+
+    # Calculate the probability density function (PDF) for sampling the direction
+    pdf_dir = 1.0 / (2 * np.pi)
+
+    return direction, light_point, pdf_dir
+
+
 
 

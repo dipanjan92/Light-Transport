@@ -67,6 +67,7 @@ def hit_object(spheres, triangles, bvh, ray):
 
     if len(spheres)>0:
         nearest_sphere = intersect_spheres(ray, spheres)
+        material = nearest_sphere.material
         if nearest_sphere is None:
             # no object was hit
             min_distance = None
@@ -83,11 +84,12 @@ def hit_object(spheres, triangles, bvh, ray):
 
         if nearest_triangle is not None:
             nearest_sphere = None
+            material = nearest_triangle.material
             min_distance = ray.tmax
             intersected_point = ray.origin + min_distance * ray.direction
             normal = nearest_triangle.get_normal(intersected_point)
 
-    isect = Intersection(nearest_triangle, nearest_sphere, min_distance, intersected_point, normal)
+    isect = Intersection(material, min_distance, intersected_point, normal)
 
     return isect
 
@@ -105,34 +107,22 @@ def create_orthonormal_system(normal):
 
 
 @numba.njit
-def uniform_hemisphere_sampling(normal_at_intersection):
+def uniform_hemisphere_sampling(surface_normal):
 
-    # random uniform samples
-    r1 = np.random.rand()
-    r2 = np.random.rand()
+    # w = surface_normal if np.dot(surface_normal, incoming_direction) < 0 else -surface_normal
+    # u = normalize(np.cross(np.array([0.0, 1.0, 0.0], np.float64) if np.fabs(surface_normal[0]) > 0.1 else np.array([1.0, 0.0, 0.0], np.float64), w))
+    # v = np.cross(surface_normal, u)
 
-    theta = np.sqrt(max((0.0, 1.0-r1**2)))
-    phi = 2 * np.pi * r2
-
-    _point = [theta * np.cos(phi), theta * np.sin(phi), r1]
-    random_point = np.array(_point, dtype=np.float64)
-
-    v2, v3 = create_orthonormal_system(normal_at_intersection)
-
-    # rot_x = np.dot(np.array([v2[0], v3[0], normal_at_intersection[0]], dtype=np.float64), random_point)
-    # rot_y = np.dot(np.array([v2[1], v3[1], normal_at_intersection[1]], dtype=np.float64), random_point)
-    # rot_z = np.dot(np.array([v2[2], v3[2], normal_at_intersection[2]], dtype=np.float64), random_point)
-    #
-    # global_ray_dir = np.array([rot_x, rot_y, rot_z, 0], dtype=np.float64)
-
-    global_ray_dir = np.array([random_point[0] * v2[0] + random_point[1] * v3[0] + random_point[2] * normal_at_intersection[0],
-                               random_point[0] * v2[1] + random_point[1] * v3[1] + random_point[2] * normal_at_intersection[1],
-                               random_point[0] * v2[2] + random_point[1] * v3[2] + random_point[2] * normal_at_intersection[2]
-                               ], dtype=np.float64)
+    rand = np.array([np.random.random(), np.random.random()], dtype=np.float64)
+    z = rand[0]
+    r = np.sqrt(np.max(0, 1 - z * z))
+    phi = 2 * np.pi * rand[1]
+    outgoing_direction = np.array([r * np.cos(phi), r * np.sin(phi), z], dtype=np.float64)
+    # outgoing_direction = normalize(outgoing_direction[0] * u + outgoing_direction[1] * v + outgoing_direction[2] * w)
 
     pdf = inv_2_pi
 
-    return global_ray_dir, pdf
+    return outgoing_direction, pdf
 
 
 @numba.njit
@@ -167,7 +157,11 @@ def get_cosine_hemisphere_pdf(cos_theta):
 @numba.njit
 def cosine_weighted_hemisphere_sampling(surface_normal, incoming_direction):
 
-    w = surface_normal if np.dot(surface_normal, incoming_direction) < 0 else -surface_normal
+    if incoming_direction is not None:
+        w = surface_normal if np.dot(surface_normal, incoming_direction) < 0 else -surface_normal
+    else:
+        w = surface_normal
+
     u = normalize(np.cross(np.array([0.0, 1.0, 0.0], np.float64) if np.fabs(surface_normal[0]) > 0.1 else np.array([1.0, 0.0, 0.0], np.float64), w))
     v = np.cross(surface_normal, u)
 

@@ -15,21 +15,19 @@ ZEROS = np.zeros((3), dtype=np.float64)
 ONES = np.ones((3), dtype=np.float64)
 
 class Medium(enum.Enum):
-    DIFFUSE = 1
-    MIRROR = 2
-    REFLECTION = 3
-    REFRACTION = 4
-    TIR = 5
-    LIGHT = 6
-    CAMERA = 7
-    SURFACE = 8
     NONE = 0
+    CAMERA = 1
+    LIGHT = 2
+    SURFACE = 3
 
 
 class MatType(enum.Enum):
     DIFFUSE = 1
     MIRROR = 2
     SPECULAR = 3
+    REFLECTION = 4
+    REFRACTION = 5
+    TIR = 6
     NONE = 0
 
 

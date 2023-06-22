@@ -26,20 +26,12 @@ def trace_path(scene, spheres, triangles, bvh, ray, bounce):
         # intersect ray with scene
         isect = hit_object(spheres, triangles, bvh, ray)
 
-        nearest_triangle = isect.nearest_triangle
-        nearest_sphere = isect.nearest_sphere
-
         # terminate path if no intersection is found
-        if nearest_triangle is None and nearest_sphere is None:
-            # no object was hit
+        if isect.min_distance is None:
             break
 
-        if nearest_triangle is None:
-            nearest_object_material = nearest_sphere.material
-        else:
-            nearest_object_material = nearest_triangle.material
-
         min_distance = isect.min_distance
+        nearest_object_material = isect.material
         intersection = isect.intersected_point
         surface_normal = isect.normal
 

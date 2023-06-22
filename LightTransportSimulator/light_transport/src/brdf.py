@@ -2,8 +2,9 @@ import numba
 import numpy as np
 from numba import jit
 
-from LightTransportSimulator.light_transport.src.constants import inv_pi, ZEROS, Medium, TransportMode, EPSILON
-from LightTransportSimulator.light_transport.src.utils import cosine_weighted_hemisphere_sampling
+from LightTransportSimulator.light_transport.src.constants import inv_pi, ZEROS, Medium, TransportMode, EPSILON, MatType
+from LightTransportSimulator.light_transport.src.utils import cosine_weighted_hemisphere_sampling, \
+    get_cosine_hemisphere_pdf
 from LightTransportSimulator.light_transport.src.vectors import normalize
 
 
@@ -103,7 +104,7 @@ def sample_diffuse(nearest_object_material, surface_normal, ray):
     new_ray_direction, pdf_fwd = cosine_weighted_hemisphere_sampling(surface_normal, ray.direction)
     # new_ray_direction = normalize(new_ray_direction)
     brdf = 1 * oren_nayar_f(ray.direction, new_ray_direction)
-    intr_type = Medium.DIFFUSE.value
+    intr_type = MatType.DIFFUSE.value
     return new_ray_direction, pdf_fwd, brdf, intr_type
 
 
@@ -113,7 +114,7 @@ def sample_mirror(nearest_object_material, surface_normal, ray):
     pdf_fwd = 1
     # fr, _ = fresnel_dielectric(np.abs(new_ray_direction[2]), 1, nearest_object_material.ior)
     # brdf =  fr * 1/np.abs(new_ray_direction[2]) # reflectance is 1 for perfect mirrors
-    intr_type = Medium.MIRROR.value
+    intr_type = MatType.MIRROR.value
     return new_ray_direction, pdf_fwd, 1, intr_type
 
 
@@ -150,7 +151,7 @@ def sample_specular(nearest_object_material, surface_normal, ray):
 
     # Total Internal Reflection
     if cos2_phi < 0:
-        intr_type = Medium.TIR.value
+        intr_type = MatType.TIR.value
         pdf = 0
         brdf = 1.0
         return reflected_direction, pdf, 1.0, intr_type
@@ -163,13 +164,13 @@ def sample_specular(nearest_object_material, surface_normal, ray):
 
     if np.random.random() < p_Re:
         # reflection
-        intr_type = Medium.REFLECTION.value
+        intr_type = MatType.REFLECTION.value
         pdf = p_Re
         brdf = Re
         return reflected_direction, pdf, brdf, intr_type
     else:
         # refraction
-        intr_type = Medium.REFRACTION.value
+        intr_type = MatType.REFRACTION.value
         pdf = 1.0 - p_Re
         brdf = 1 - Re
         return transmitted_direction, pdf, brdf, intr_type
@@ -178,12 +179,22 @@ def sample_specular(nearest_object_material, surface_normal, ray):
 @numba.njit
 def bxdf(prev_v, next_v):
     # camera or light endpoints should not arrive here
-    w = normalize(next_v.point - prev_v.point)
-    if prev_v.medium==Medium.SURFACE.value:
-        if prev_v.intr_type==Medium.DIFFUSE.value:
-            return oren_nayar_f(prev_v.ray_direction, w)
+    w = normalize(next_v.isec.intersected_point - prev_v.isec.intersected_point)
+    if prev_v.type==Medium.SURFACE.value:
+        if prev_v.isec.material.type==MatType.DIFFUSE.value:
+            return oren_nayar_f(prev_v.ray.direction, w)
         else:
             # for all other specular events
             return 0
+    else:
+        return 0
+
+
+@numba.njit
+def get_bsdf_pdf(wp, wn):
+    if wp is None:
+        return get_cosine_hemisphere_pdf(np.abs(wn[2]))
+    elif wp[2]*wn[2]>0:
+        return get_cosine_hemisphere_pdf(np.abs(wn[2]))
     else:
         return 0
