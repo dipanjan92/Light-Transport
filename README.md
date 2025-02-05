@@ -1,2 +1,3 @@
-# Light-Transport
- Monte Carlo Simulation of Light Transport
+# Ray-Primitive Intersection
+
+Implementation of 3D Collision Detection Algorithms
