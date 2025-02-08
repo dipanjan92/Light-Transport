@@ -1,19 +1,37 @@
-import numpy as np
-import numba
-from utils.vectors import normalize
+import jax
+import jax.numpy as jnp
+from dataclasses import dataclass
 
-
-c_1d_vec = numba.types.Array(dtype=numba.float64, ndim=1, layout="C")
-
-@numba.experimental.jitclass([
-    ('origin', numba.float64[:]),
-    ('direction', numba.float64[:]),
-    ('tmin', numba.float64),
-    ('tmax', numba.float64)
-])
+@dataclass(frozen=True)
 class Ray:
-    def __init__(self, origin, direction):
-        self.origin = origin
-        self.direction = direction
-        self.tmin = 0.0
-        self.tmax = np.inf
+    origin: jnp.ndarray  # Expected shape: (3,)
+    direction: jnp.ndarray  # Expected shape: (3,)
+
+    def at(self, t: float) -> jnp.ndarray:
+        """Return the point along the ray at distance t."""
+        return self.origin + t * self.direction
+
+def offset_ray_origin(p: jnp.ndarray, n: jnp.ndarray, w: jnp.ndarray) -> jnp.ndarray:
+    """
+    Compute an offset for the ray origin to avoid self-intersection.
+
+    p: the original point (shape (3,))
+    n: the normal at point p (shape (3,))
+    w: the direction for which the ray is being spawned (shape (3,))
+    """
+    epsilon = 1e-4
+    base_offset = n * epsilon
+    dot_val = jnp.dot(w, n)
+    offset = jax.lax.cond(dot_val < 0,
+                          lambda _: -base_offset,
+                          lambda _: base_offset,
+                          operand=None)
+    return p + offset
+
+def spawn_ray(p: jnp.ndarray, n: jnp.ndarray, d: jnp.ndarray) -> Ray:
+    """
+    Spawn a new ray from point p with direction d, offsetting the origin
+    along the normal n to avoid self-intersections.
+    """
+    origin = offset_ray_origin(p, n, d)
+    return Ray(origin, d)

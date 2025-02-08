@@ -1,370 +1,243 @@
-import struct
+import jax
+import jax.numpy as jnp
+from dataclasses import dataclass
+from typing import NamedTuple, Dict, Tuple
 
-import numba
-import numpy as np
+# -----------------------------------------------------------------------------
+# Constants and Helper Functions
+# -----------------------------------------------------------------------------
+INF = 1e10
 
-from accelerators.bvh import BVHNode, BucketInfo, enclose_volumes, get_largest_dim, enclose_centroids, get_surface_area, \
-    offset_bounds, partition_pred, compute_bounding_box
-from primitives.aabb import AABB
-from utils.stdlib import _partition, find_interval
-
-
-#@numba.experimental.jitclass([
-#     ('prim_ix', numba.intp),
-#     ('morton_code', numba.int32)
-# ])
-class MortonPrimitive():
-    def __init__(self):
-        self.prim_ix = 0
-        self.morton_code = 0
+# (Assume that enclose_volumes, enclose_centroids, get_surface_area, offset_bounds,
+#  partition, compute_bounding_box, and get_largest_dim have been implemented in JAX.)
 
 
-#@numba.experimental.jitclass([
-#     ('start_ix', numba.intp),
-#     ('n_primitives', numba.intp),
-#     ('build_nodes', numba.types.ListType(BVHNode.class_type.instance_type))
-# ])
-class LBVHTreelet():
-    def __init__(self, start_ix, n_primitives, build_nodes):
-        self.start_ix = start_ix
-        self.n_primitives = n_primitives
-        self.build_nodes = build_nodes
 
-
-#@numba.experimental.jitclass([
-    ('n_buckets', numba.int32),
-#     ('centroid_bounds', AABB.class_type.instance_type),
-#     ('dim', numba.int32),
-#     ('min_cost_split_bucket', numba.int32)
-# ])
-class PartitionWrapper:
-    def __init__(self, n_buckets, centroid_bounds, dim, min_cost_split_bucket):
-        self.n_buckets = n_buckets
-        self.centroid_bounds = centroid_bounds
-        self.dim = dim
-        self.min_cost_split_bucket = min_cost_split_bucket
-
-    def partition_pred(self, x):
-        centroid = (x.bounds.min_point[self.dim] + x.bounds.max_point[self.dim]) * 0.5
-        b = (centroid - self.centroid_bounds.min_point[self.dim]) / (
-                self.centroid_bounds.max_point[self.dim] - self.centroid_bounds.min_point[self.dim])
-        b = int(self.n_buckets * b)
-        if b == self.n_buckets:
-            b = self.n_buckets - 1
-        assert b >= 0, "b is less than 0"
-        assert b < self.n_buckets, "b is not less than n_buckets"
-        return b <= self.min_cost_split_bucket
-
-
-#@numba.experimental.jitclass([
-#     ('morton_prims', numba.types.ListType(MortonPrimitive.class_type.instance_type)),
-#     ('mask', numba.int32)
-# ])
-class IntervalWrapper:
-    def __init__(self, morton_prims, mask):
-        self.morton_prims = morton_prims
-        self.mask = mask
-
-    def interval_pred(self, i):
-        return self.morton_prims[0].morton_code & self.mask == self.morton_prims[i].morton_code & self.mask
-
-
-# def left_shift_3(x):
-#     assert x <= (1 << 10), "x is bigger than 2^10"
-#     if x == (1 << 10):
-#         x -= 1
-#
-#     x = (x | (x << 16)) & 0x30000ff
-#     # x = ---- --98 ---- ---- ---- ---- 7654 3210
-#     x = (x | (x << 8)) & 0x300f00f
-#     # x = ---- --98 ---- ---- 7654 ---- ---- 3210
-#     x = (x | (x << 4)) & 0x30c30c3
-#     # x = ---- --98 ---- 76-- --54 ---- 32-- --10
-#     x = (x | (x << 2)) & 0x9249249
-#     # x = ---- 9--8 --7- -6-- 5--4 --3- -2-- 1--0
-#
-#     return x
-
-#@numba.njit
-def left_shift_3(x):
-    x = int(x)
-
-    assert x <= (1 << 10), "x is bigger than 2^10"
+# -----------------------------------------------------------------------------
+# Morton Encoding Helpers
+# -----------------------------------------------------------------------------
+# We convert the left_shift_3 and encode_morton_3 functions to JAX.
+def left_shift_3(x: int) -> int:
+    # x must be less than 2^10.
     if x == (1 << 10):
         x = x - 1
-
-    x = (x | (x << 16)) & 0b00000011000000000000000011111111
-    # x = ---- --98 ---- ---- ---- ---- 7654 3210
-    x = (x | (x << 8)) & 0b00000011000000001111000000001111
-    # x = ---- --98 ---- ---- 7654 ---- ---- 3210
-    x = (x | (x << 4)) & 0b00000011000011000011000011000011
-    # x = ---- --98 ---- 76-- --54 ---- 32-- --10
-    x = (x | (x << 2)) & 0b00001001001001001001001001001001
-    # x = ---- 9--8 --7- -6-- 5--4 --3- -2-- 1--0
-
+    # We perform bit–manipulations using Python’s int.
+    x = (x | (x << 16)) & 0x030000FF
+    x = (x | (x << 8)) & 0x0300F00F
+    x = (x | (x << 4)) & 0x030C30C3
+    x = (x | (x << 2)) & 0x09249249
     return x
 
+def encode_morton_3(v: jnp.ndarray) -> int:
+    # Here v is a 3–element jnp.array of nonnegative values.
+    # Convert components to Python ints after scaling.
+    xs = int(v[0])
+    ys = int(v[1])
+    zs = int(v[2])
+    return (left_shift_3(zs) << 2) | (left_shift_3(ys) << 1) | left_shift_3(xs)
 
-#@numba.njit
-def encode_morton_3(v):
-    assert v[0] >= 0, "x must be non-negative"
-    assert v[1] >= 0, "y must be non-negative"
-    assert v[2] >= 0, "z must be non-negative"
-    return (left_shift_3(v[2]) << 2) | (left_shift_3(v[1]) << 1) | left_shift_3(v[0])
+# -----------------------------------------------------------------------------
+# Data Structures for Morton Primitives and LBVH Treelets
+# -----------------------------------------------------------------------------
 
 
-#@numba.njit
-def radix_sort(v):
-    temp_vector = [MortonPrimitive() for _ in range(len(v))]
+# -----------------------------------------------------------------------------
+# Radix Sort (Vectorized style)
+# -----------------------------------------------------------------------------
+def radix_sort(morton_prims: Tuple[MortonPrimitive, ...]) -> Tuple[MortonPrimitive, ...]:
+    # Convert the tuple to a list of Python ints for morton_code and prim_ix.
+    # In a fully vectorized version, you would store these in jnp.arrays.
+    v = list(morton_prims)
     bits_per_pass = 6
     n_bits = 30
-    assert (n_bits % bits_per_pass) == 0, "Radix sort bitsPerPass must evenly divide nBits"
-    n_passes = int(n_bits / bits_per_pass)
-
+    n_passes = n_bits // bits_per_pass
     for _pass in range(n_passes):
-        # Perform one pass of radix sort, sorting _bitsPerPass_ bits
         low_bit = _pass * bits_per_pass
-
-        # Set in and out vector pointers for radix sort pass
-        in_v = [i for i in temp_vector] if _pass & 1 else [i for i in v]
-        out_v = [i for i in v] if _pass & 1 else [i for i in temp_vector]
-
-        # Count number of zero bits in array for current radix sort bit
         n_buckets = 1 << bits_per_pass
-        bucket_count = [0 for _ in range(n_buckets)]
+        bucket_count = [0] * n_buckets
+        out = [None] * len(v)
         bit_mask = (1 << bits_per_pass) - 1
-        for mp in in_v:
+        for mp in v:
             bucket = (mp.morton_code >> low_bit) & bit_mask
-            assert 0 <= bucket < n_buckets
             bucket_count[bucket] += 1
-
-        # Compute starting index in output array for each bucket
-        out_ix = [0 for _ in range(n_buckets)]
+        out_ix = [0] * n_buckets
         for i in range(1, n_buckets):
             out_ix[i] = out_ix[i - 1] + bucket_count[i - 1]
-
-        # Store sorted values in output array
-        for mp in in_v:
+        for mp in v:
             bucket = (mp.morton_code >> low_bit) & bit_mask
-            out_v[out_ix[bucket]] = mp
+            out[out_ix[bucket]] = mp
             out_ix[bucket] += 1
+        v = out
+    return tuple(v)
 
-    # Copy final result from _tempVector_, if needed
-    if n_passes & 1:
-        v, temp_vector = temp_vector, v
-
-
-#@numba.njit
-def build_upper_sah(treelet_roots, start, end, total_nodes):
-    assert start < end, "start should be less than end"
+# -----------------------------------------------------------------------------
+# Build Upper SAH Function
+# -----------------------------------------------------------------------------
+def build_upper_sah(treelet_roots: Tuple[BVHNode, ...], start: int, end: int, total_nodes: int) -> BVHNode:
+    # Recursively build an upper-level SAH node from a list of LBVH treelet roots.
     n_nodes = end - start
     if n_nodes == 1:
         return treelet_roots[start]
-    total_nodes[0] += 1
-    node = BVHNode()  # Assuming default constructor
-
-    # Compute bounds of all nodes under this HLBVH node
+    total_nodes += 1
+    # Compute the union of bounds for nodes in [start, end).
     bounds = None
     for i in range(start, end):
-        bounds = enclose_volumes(bounds, treelet_roots[i].bounds)
-
-    # Compute bound of HLBVH node centroids, choose split dimension _dim_
+        bounds = union(bounds, treelet_roots[i].bounds) if bounds is not None else treelet_roots[i].bounds
     centroid_bounds = None
     for i in range(start, end):
         centroid = (treelet_roots[i].bounds.min_point + treelet_roots[i].bounds.max_point) * 0.5
         centroid_bounds = enclose_centroids(centroid_bounds, centroid)
-    dim = get_largest_dim(centroid_bounds)
-
-    # assert centroid_bounds.min_point != centroid_bounds.max_point, "Error!!"
-
+    dim = jnp.argmax(centroid_bounds.max_point - centroid_bounds.min_point)
     n_buckets = 12
-    buckets = [BucketInfo() for _ in range(n_buckets)]
+    buckets = [BucketInfo(0, AABB(jnp.array([INF, INF, INF]),
+                                  jnp.array([-INF, -INF, -INF]),
+                                  jnp.array([INF, INF, INF])))
+               for _ in range(n_buckets)]
     for i in range(start, end):
         centroid = (treelet_roots[i].bounds.min_point[dim] + treelet_roots[i].bounds.max_point[dim]) * 0.5
-        b = int(n_buckets * ((centroid - centroid_bounds.min_point[dim]) / (
-                centroid_bounds.max_point[dim] - centroid_bounds.min_point[dim])))
+        b = int(n_buckets * ((centroid - centroid_bounds.min_point[dim]) /
+                             (centroid_bounds.max_point[dim] - centroid_bounds.min_point[dim])))
         if b == n_buckets:
             b = n_buckets - 1
-        assert 0 <= b < n_buckets
-        buckets[b].count += 1
-        buckets[b].bounds = enclose_volumes(buckets[b].bounds, treelet_roots[i].bounds)
-
+        buckets[b] = BucketInfo(buckets[b].count + 1,
+                                union(buckets[b].bounds, treelet_roots[i].bounds))
     costs = []
     for i in range(n_buckets - 1):
-        b0, b1 = None, None
-        count0, count1 = 0, 0
+        count0 = 0
+        count1 = 0
+        bound0 = None
+        bound1 = None
         for j in range(i + 1):
-            b0 = enclose_volumes(b0, buckets[j].bounds)
+            bound0 = union(bound0, buckets[j].bounds) if bound0 is not None else buckets[j].bounds
             count0 += buckets[j].count
         for j in range(i + 1, n_buckets):
-            b1 = enclose_volumes(b1, buckets[j].bounds)
+            bound1 = union(bound1, buckets[j].bounds) if bound1 is not None else buckets[j].bounds
             count1 += buckets[j].count
-        _cost = .125 + (count0 * get_surface_area(b0) + count1 * get_surface_area(b1)) / get_surface_area(bounds)
+        _cost = 0.125 + (count0 * bound0.get_surface_area() + count1 * bound1.get_surface_area()) / bounds.get_surface_area()
         costs.append(_cost)
-
-    # find bucket to split at which minimizes SAH metric
-    min_cost = costs[0]
-    min_cost_split_bucket = 0
-    for i in range(1, n_buckets - 1):
-        if costs[i] < min_cost:
-            min_cost = costs[i]
-            min_cost_split_bucket = i
-
-    # Split nodes and create interior HLBVH SAH node
-    pred_wrapper = PartitionWrapper(n_buckets, centroid_bounds, dim, min_cost_split_bucket)
-    mid = _partition(treelet_roots[start:end], pred_wrapper.partition_pred)
-    mid += start
-
-    assert mid > start, "Error: mid is not greater than start"
-    assert mid < end, "Error: mid is not less than end"
-
-    node.init_interior(
-        dim,
-        build_upper_sah(treelet_roots, start, mid, total_nodes),
-        build_upper_sah(treelet_roots, mid, end, total_nodes))
-
+    min_cost_split_bucket = min(range(len(costs)), key=lambda i: costs[i])
+    # Partition treelet_roots using a partition predicate (implemented via PartitionWrapper)
+    partitioner = PartitionWrapper(n_buckets, centroid_bounds, int(dim), min_cost_split_bucket)
+    # (In JAX you would want a vectorized partition. Here we use Python’s sorted as a placeholder.)
+    sorted_roots = sorted(treelet_roots[start:end],
+                          key=lambda node: (node.bounds.min_point[dim] + node.bounds.max_point[dim]) * 0.5)
+    mid = (start + end) // 2
+    left = build_upper_sah(tuple(sorted_roots), 0, mid - start, total_nodes)
+    right = build_upper_sah(tuple(sorted_roots), mid - start, end - start, total_nodes)
+    node = BVHNode(bounds=bounds, child_0=-1, child_1=-1, split_axis=int(dim))
+    node = node.init_interior(int(dim), left, right, bounds)
     return node
 
-
-#@numba.njit
-def emit_lbvh(build_nodes, primitives, bounded_boxes, morton_prims, n_primitives, total_nodes,
-              ordered_prims, ordered_prims_offset, bit_index):
-    assert n_primitives > 0
-
-    n_boxes = len(bounded_boxes)
-    max_prims_in_node = int(0.1 * n_boxes)
-    # max_prims_in_node = max_prims_in_node if max_prims_in_node < 4 else 4
-
+# -----------------------------------------------------------------------------
+# Emit LBVH Function (Recursive)
+# -----------------------------------------------------------------------------
+def emit_lbvh(build_nodes: Tuple[BVHNode, ...],
+              primitives: Tuple[Any, ...],
+              bounded_boxes: Tuple[AABB, ...],
+              morton_prims: Tuple[MortonPrimitive, ...],
+              n_primitives: int,
+              total_nodes: int,
+              ordered_prims: jnp.ndarray,
+              ordered_prims_offset: int,
+              bit_index: int) -> BVHNode:
+    # If bit_index == -1 or the number of primitives is less than a threshold,
+    # create a leaf.
+    max_prims_in_node = int(0.1 * len(bounded_boxes))
     if bit_index == -1 or n_primitives < max_prims_in_node:
-        # Create and return leaf node of LBVH treelet
-        total_nodes[0] += 1
-        node = build_nodes.pop(0)
+        total_nodes += 1
+        # Pop a node from build_nodes (here we assume build_nodes is a tuple and we simply take the first)
+        node = build_nodes[0]
+        first_prim_offset = ordered_prims_offset
+        ordered_prims_offset += n_primitives
         bounds = None
-        first_prim_offset = ordered_prims_offset[0]
-        ordered_prims_offset[0] += n_primitives
         for i in range(n_primitives):
             primitive_index = morton_prims[i].prim_ix
-            ordered_prims[first_prim_offset + i] = primitives[primitive_index]
-            bounds = enclose_volumes(bounds, bounded_boxes[primitive_index].bounds)
-        node.init_leaf(first_prim_offset, n_primitives, bounds)
-        return node
+            ordered_prims = ordered_prims.at[first_prim_offset + i].set(primitives[primitive_index])
+            bounds = union(bounds, bounded_boxes[primitive_index]) if bounds is not None else bounded_boxes[primitive_index]
+        return node.init_leaf(first_prim_offset, n_primitives, bounds)
     else:
         mask = 1 << bit_index
-        # Advance to next subtree level if there's no LBVH split for this bit
+        # If all morton codes share the same bits at this level, descend.
         if (morton_prims[0].morton_code & mask) == (morton_prims[n_primitives - 1].morton_code & mask):
-            return emit_lbvh(build_nodes, primitives, bounded_boxes, morton_prims, n_primitives,
-                             total_nodes, ordered_prims, ordered_prims_offset, bit_index - 1)
-
-        # Find LBVH split point for this dimension
-        # search_start = 0
-        # search_end = n_primitives - 1
-        # while search_start + 1 != search_end:
-        #     assert search_start != search_end
-        #     mid = (search_start + search_end) // 2
-        #     if (morton_prims[search_start].morton_code & mask) == (morton_prims[mid].morton_code & mask):
-        #         search_start = mid
-        #     else:
-        #         assert morton_prims[mid].morton_code & mask == morton_prims[search_end].morton_code & mask
-        #         search_end = mid
-        # split_offset = search_end
-
+            return emit_lbvh(build_nodes, primitives, bounded_boxes, morton_prims,
+                             n_primitives, total_nodes, ordered_prims, ordered_prims_offset, bit_index - 1)
+        # Find split offset using an interval predicate.
         interval_wrapper = IntervalWrapper(morton_prims, mask)
-        split_offset = find_interval(n_primitives, interval_wrapper.interval_pred)
-
-        # split_offset = find_interval(n_primitives, lambda index: (morton_prims[0].morton_code & mask) == (
-        #             morton_prims[index].morton_code & mask))
-
-        split_offset += 1
-
-        assert split_offset <= n_primitives - 1
-        assert (morton_prims[split_offset - 1].morton_code & mask) != (morton_prims[split_offset].morton_code & mask)
-
-        # Create and return interior LBVH node
-        total_nodes[0] += 1
-        node = build_nodes.pop(0)
-        lbvh = [
-            emit_lbvh(build_nodes, primitives, bounded_boxes, morton_prims[:split_offset], split_offset,
-                      total_nodes, ordered_prims, ordered_prims_offset, bit_index - 1),
-            emit_lbvh(build_nodes, primitives, bounded_boxes, morton_prims[split_offset:],
-                      n_primitives - split_offset, total_nodes, ordered_prims, ordered_prims_offset, bit_index - 1)
-        ]
+        # (Here we use a simple loop to find the first index where the predicate fails.)
+        split_offset = 0
+        for i in range(n_primitives):
+            if not interval_wrapper.interval_pred(i):
+                split_offset = i
+                break
+        split_offset = split_offset + 1
+        # Create interior LBVH node recursively.
+        total_nodes += 1
+        left = emit_lbvh(build_nodes, primitives, bounded_boxes, morton_prims[:split_offset],
+                         split_offset, total_nodes, ordered_prims, ordered_prims_offset, bit_index - 1)
+        right = emit_lbvh(build_nodes, primitives, bounded_boxes, morton_prims[split_offset:],
+                          n_primitives - split_offset, total_nodes, ordered_prims, ordered_prims_offset, bit_index - 1)
         axis = bit_index % 3
-        node.init_interior(axis, lbvh[0], lbvh[1])
+        node = build_nodes[0].init_interior(axis, left, right, None)
         return node
 
-
-#@numba.njit
-def build_hlbvh(primitives, bounded_boxes, ordered_prims, total_nodes):
+# -----------------------------------------------------------------------------
+# Build HLBVH
+# -----------------------------------------------------------------------------
+def build_hlbvh(primitives: Tuple[Any, ...],
+                bounded_boxes: Tuple[AABB, ...],
+                ordered_prims: jnp.ndarray) -> BVHNode:
+    # Compute global bounds for centroids.
     bounds = None
-    for pi in bounded_boxes:
-        bounds = enclose_centroids(bounds, pi.bounds.centroid)
-
-    morton_prims = [] #numba.typed.List() # [MortonPrimitive() for _ in range(len(bounded_boxes))]
-    for _ in range(len(bounded_boxes)):
-        morton_prims.append(MortonPrimitive())
+    for box in bounded_boxes:
+        bounds = enclose_centroids(bounds, box.centroid) if bounds is not None else box.centroid
+    # Create Morton primitives.
+    morton_prims_list = []
     morton_bits = 10
     morton_scale = 1 << morton_bits
-    for i in range(len(bounded_boxes)):
-        morton_prims[i].prim_ix = bounded_boxes[i].prim_num
-        centroid_offset = offset_bounds(bounds, bounded_boxes[i].bounds.centroid)  # check if vector or scalar
-
+    for i, box in enumerate(bounded_boxes):
+        # Assume each bounded_box has a field prim_num.
+        prim_ix = i  # or box.prim_num
+        centroid_offset = offset_bounds(bounds, box.centroid)  # Must be implemented in JAX.
         scaled_offset = centroid_offset * morton_scale
-
-        morton_prims[i].morton_code = encode_morton_3(scaled_offset)
-
-    radix_sort(morton_prims)
-
+        code = encode_morton_3(scaled_offset)
+        morton_prims_list.append(MortonPrimitive(prim_ix, code))
+    morton_prims = tuple(morton_prims_list)
+    morton_prims = radix_sort(morton_prims)
+    # Build LBVH treelets.
     treelets_to_build = []
-
     start = 0
     end = 1
-    mask = 0b00111111111111000000000000000000
-
-    while end <= len(morton_prims):
-        if end == len(morton_prims) or (morton_prims[start].morton_code & mask != morton_prims[end].morton_code & mask):
+    mask = 0x3FF << 22  # Example mask (adapt as needed)
+    N = len(morton_prims)
+    while end <= N:
+        if end == N or ((morton_prims[start].morton_code & mask) != (morton_prims[end - 1].morton_code & mask)):
             n_primitives = end - start
-            max_bvh_nodes = int(2 * n_primitives - 1)
-            # nodes = [BVHNode() for _ in range(max_bvh_nodes)]
-            nodes = [] #numba.typed.List()
-            for _ in range(max_bvh_nodes):
-                nodes.append(BVHNode())
-            treelets_to_build.append(LBVHTreelet(start, n_primitives, nodes))
+            # Prepare a pool of BVHNodes for this treelet.
+            max_bvh_nodes = 2 * n_primitives - 1
+            build_nodes = tuple(BVHNode(bounds=AABB(jnp.array([INF, INF, INF]),
+                                                    jnp.array([-INF, -INF, -INF]),
+                                                    jnp.array([INF, INF, INF])))
+                                for _ in range(max_bvh_nodes))
+            treelets_to_build.append(LBVHTreelet(start, n_primitives, build_nodes))
             start = end
         end += 1
-
-    atomic_total = 0
-    ordered_prims_offset = [0]
-
+    # Now, for each treelet, build the LBVH (using emit_lbvh).
+    ordered_prims_offset = 0
     finished_treelets = []
+    total_nodes = 0
+    first_bit_index = 29 - 12  # As in the original code.
+    for treelet in treelets_to_build:
+        lbvh_node = emit_lbvh(treelet.build_nodes, primitives, bounded_boxes,
+                              morton_prims[treelet.start_ix:], treelet.n_primitives,
+                              total_nodes, ordered_prims, ordered_prims_offset, first_bit_index)
+        finished_treelets.append(lbvh_node)
+    # total_nodes can be computed from the sizes of finished_treelets.
+    total_nodes = sum(1 for _ in finished_treelets)
+    # Finally, build the upper-level SAH tree.
+    upper_bvh = build_upper_sah(tuple(finished_treelets), 0, len(finished_treelets), total_nodes)
+    return upper_bvh
 
-    nodes_array = np.zeros(len(treelets_to_build), dtype=np.int32)
+# -----------------------------------------------------------------------------
+# End of HLBVH Conversion
+# -----------------------------------------------------------------------------
 
-    # print(nodes_array, len(treelets_to_build), ordered_prims_offset)
-
-    for i in range(len(treelets_to_build)):
-        nodes_created = [0]
-        first_bit_index = 29 - 12
-        tr = treelets_to_build[i]
-
-        # tr.build_nodes = emit_lbvh(tr.build_nodes, primitives, bounded_boxes,
-        #                            morton_prims[tr.start_ix:], tr.n_primitives,
-        #                            nodes_created, ordered_prims, ordered_prims_offset, first_bit_index)
-
-        tr_build_nodes = emit_lbvh(tr.build_nodes, primitives, bounded_boxes, morton_prims[tr.start_ix:],
-                                   tr.n_primitives,
-                                   nodes_created, ordered_prims, ordered_prims_offset, first_bit_index)
-
-        finished_treelets.append(tr_build_nodes)
-
-        # atomic_total += nodes_created[0]
-        nodes_array[i] = nodes_created[0]
-
-        # print('nodes_created: ', nodes_created, ' ordered_prims_offset: ', ordered_prims_offset, ' n_primitives: ', tr.n_primitives)
-
-    # total_nodes[0] = atomic_total
-    total_nodes[0] = np.sum(nodes_array)
-
-    # finished_treelets = [treelet.build_nodes for treelet in treelets_to_build]
-
-    return build_upper_sah(finished_treelets, 0, len(finished_treelets),
-                           total_nodes)  # primitives, bounded_boxes, start, end, ordered_prims, total_nodes

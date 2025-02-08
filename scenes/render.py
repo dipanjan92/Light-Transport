@@ -41,7 +41,7 @@ def render_scene(scene, primitives, bvh, progress_proxy):
 
 
 @numba.njit(nogil=True, parallel=True)
-def _render_scene(scene, primitives, bvh):
+def render_scene(scene, primitives, bvh):
     # without progress bar
     intersections_count = 0
     for y in numba.prange(scene.height):
