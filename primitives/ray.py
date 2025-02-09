@@ -2,6 +2,9 @@ import jax
 import jax.numpy as jnp
 from dataclasses import dataclass
 
+from jax import tree_util
+
+
 @dataclass(frozen=True)
 class Ray:
     origin: jnp.ndarray  # Expected shape: (3,)
@@ -35,3 +38,14 @@ def spawn_ray(p: jnp.ndarray, n: jnp.ndarray, d: jnp.ndarray) -> Ray:
     """
     origin = offset_ray_origin(p, n, d)
     return Ray(origin, d)
+
+
+def _ray_flatten(ray: Ray):
+    children = (ray.origin, ray.direction)
+    aux = None
+    return children, aux
+
+def _ray_unflatten(aux, children):
+    return Ray(children[0], children[1])
+
+tree_util.register_pytree_node(Ray, _ray_flatten, _ray_unflatten)

@@ -1,0 +1,8 @@
+# A simple square (2 triangles) in the XY plane:
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 1.0 1.0 0.0
+v 0.0 1.0 0.0
+
+f 1 2 3
+f 1 3 4

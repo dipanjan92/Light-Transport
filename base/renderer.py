@@ -1,93 +1,111 @@
+# render.py
 import jax
 import jax.numpy as jnp
-from jax import random
-from typing import Any, Tuple
+from base.camera import PerspectiveCamera
+from base.frame import frame_from_z
+from accelerators.bvh import intersect_bvh, build_bvh, BVH
+import jax.numpy as jnp
 
 
-# Assume the following are imported from your other modules (all converted to JAX):
-#   - Ray (a dataclass with fields origin and direction)
-#   - path_trace(ray, primitives, bvh, lights, light_sampler, sample_lights, sample_bsdf, max_depth)
-#   - trace_mis(ray, primitives, bvh, lights, light_sampler, sample_lights, sample_bsdf, max_depth)
-#   - UniformLightSampler (converted to a functional or dataclass version)
-#
-# Also assume that the scene structure has attributes:
-#   scene.spp (samples per pixel, int)
-#   scene.integrator (0 or 1)
-#   scene.sample_lights, scene.sample_bsdf, scene.max_depth
-#
-# And the camera has attributes:
-#   camera.width, camera.height, and a method generate_ray(u, v) -> (ray_origin, ray_direction)
-
-def render(key: Any,
-           scene: Any,
-           image_shape: Tuple[int, int],
-           lights: Any,
-           camera: Any,
-           primitives: Any,
-           bvh: Any) -> jnp.ndarray:
+def create_default_camera(triangles: dict, width: int, height: int, fov: float) -> PerspectiveCamera:
     """
-    Render an image given the scene, camera, lights, primitives and BVH.
-    `key` is a PRNG key.
-    `image_shape` is a tuple (height, width).
+    Compute the overall bounds of the object from triangle data and create a default
+    perspective camera positioned so that the entire object appears on screen.
+
+    Parameters:
+      triangles: Dictionary with keys "vertex_1", "vertex_2", "vertex_3", etc.
+      width: Image width in pixels.
+      height: Image height in pixels.
+      fov: Vertical field-of-view in degrees.
+
+    Returns:
+      A PerspectiveCamera instance.
     """
-    height, width = image_shape
-    spp = scene.spp
+    # Compute overall bounds from all vertices.
+    v_all = jnp.concatenate([triangles["vertex_1"],
+                             triangles["vertex_2"],
+                             triangles["vertex_3"]], axis=0)
+    obj_min = jnp.min(v_all, axis=0)
+    obj_max = jnp.max(v_all, axis=0)
+    center = (obj_min + obj_max) / 2.0
+    extent = obj_max - obj_min
+    radius = 0.5 * jnp.max(extent)
 
-    # Create a light sampler instance.
-    light_sampler = UniformLightSampler(num_lights=lights.shape[0])
+    # Convert fov to radians.
+    fov_rad = fov * jnp.pi / 180.0
+    # Compute a distance that fits the object in the view. (Add a little extra margin.)
+    d = radius / jnp.tan(fov_rad / 2.0) + radius
 
-    # We'll define a function that renders one pixel.
-    # To simplify key management, we assume that for each pixel we generate spp independent keys.
-    def render_pixel(pixel_idx: Tuple[int, int], key: Any) -> jnp.ndarray:
-        j, i = pixel_idx  # j is row (height index), i is column (width index)
-        # Generate a separate PRNG key for this pixel and split into spp keys.
-        pixel_key, subkey = random.split(key)
-        sample_keys = random.split(subkey, spp)
+    # Position the camera along the positive z-axis so that it looks toward the object center.
+    position = center + jnp.array([0.0, 0.0, d])
+    # The forward direction is from camera position to the object center.
+    forward = (center - position) / jnp.linalg.norm(center - position)
+    # Use a fixed up vector.
+    up = jnp.array([0.0, 1.0, 0.0])
+    # Create a frame from the forward direction.
+    frame = frame_from_z(forward)
 
-        # Accumulate radiance for this pixel.
-        def sample_body(acc, sample_key):
-            # For each sample, generate two independent uniform random numbers for u and v.
-            key1, key2 = random.split(sample_key)
-            u = (i + random.uniform(key1, minval=0.0, maxval=1.0)) / width
-            v = (j + random.uniform(key2, minval=0.0, maxval=1.0)) / height
-            # Generate the camera ray.
-            ray_origin, ray_direction = camera.generate_ray(u, v)
-            ray = Ray(origin=ray_origin, direction=ray_direction)
-            # Choose the integrator.
-            sample_L = jax.lax.cond(
-                scene.integrator == 0,
-                lambda _: path_trace(ray, primitives, bvh, lights, light_sampler,
-                                     sample_lights=scene.sample_lights,
-                                     sample_bsdf=scene.sample_bsdf,
-                                     max_depth=scene.max_depth),
-                lambda _: trace_mis(ray, primitives, bvh, lights, light_sampler,
-                                    sample_lights=scene.sample_lights,
-                                    sample_bsdf=scene.sample_bsdf,
-                                    max_depth=scene.max_depth),
-                operand=None
-            )
-            return acc + sample_L, None
+    aspect_ratio = width / height
+    # Compute the physical film/sensor size from the fov.
+    screen_dy = 2 * jnp.tan(fov_rad / 2.0)
+    screen_dx = screen_dy * aspect_ratio
+    # Compute differentials in camera space.
+    dx_camera = jnp.array([screen_dx / width, 0.0, 0.0])
+    dy_camera = jnp.array([0.0, screen_dy / height, 0.0])
+    lens_radius = 0.0  # Pinhole camera.
+    focal_distance = d
 
-        # Use lax.scan to loop over spp samples.
-        L_total, _ = jax.lax.scan(sample_body,
-                                  jnp.array([0.0, 0.0, 0.0]),
-                                  sample_keys)
-        return L_total / spp
+    return PerspectiveCamera(
+        width=width,
+        height=height,
+        position=position,
+        frame=frame,
+        fov=fov,
+        aspect_ratio=aspect_ratio,
+        lens_radius=lens_radius,
+        focal_distance=focal_distance,
+        screen_dx=screen_dx,
+        screen_dy=screen_dy,
+        dx_camera=dx_camera,
+        dy_camera=dy_camera
+    )
 
-    # Create a grid of pixel indices.
-    jj = jnp.arange(height)
-    ii = jnp.arange(width)
-    # Use jnp.meshgrid to create a (height, width, 2) array of pixel indices.
-    grid_j, grid_i = jnp.meshgrid(jj, ii, indexing='ij')
-    # Flatten the pixel index arrays.
-    pixel_indices = jnp.stack([grid_j.flatten(), grid_i.flatten()], axis=-1)  # shape (height*width, 2)
 
-    # Split the main key into one key per pixel.
-    pixel_keys = random.split(key, pixel_indices.shape[0])
+def render(triangles: dict, bvh: BVH, camera: PerspectiveCamera) -> jnp.ndarray:
+    """
+    Render an image by shooting rays from the camera into the scene and testing
+    intersections against the BVH. If a ray intersects the object, the corresponding
+    pixel is painted blue; otherwise, it is black.
 
-    # Vectorize render_pixel over the flattened pixel index and key.
-    render_pixel_vmap = jax.vmap(render_pixel, in_axes=(0, 0))
-    pixels_flat = render_pixel_vmap(pixel_indices, pixel_keys)  # shape (height*width, 3)
-    # Reshape back to image shape.
-    image = pixels_flat.reshape((height, width, 3))
+    Parameters:
+      triangles: Dictionary of triangle arrays.
+      bvh: BVH instance for the scene.
+      camera: PerspectiveCamera instance.
+
+    Returns:
+      An image as a jnp.ndarray of shape (height, width, 3) with values in [0,1].
+    """
+    height = camera.height
+    width = camera.width
+
+    # Define a function that computes the color for one pixel.
+    def pixel_color(s, t):
+        # Generate a ray from the camera given raster coordinates (s,t) in [0,1].
+        ray_origin, ray_dir = camera.generate_ray(s, t)
+        # Intersect the ray with the scene BVH.
+        isec = intersect_bvh(ray_origin, ray_dir, bvh, triangles, t_max=1e10)
+        # If an intersection is found, return blue; otherwise black.
+        return jnp.where(isec.intersected == 1,
+                         jnp.array([0.0, 0.0, 1.0]),
+                         jnp.array([0.0, 0.0, 0.0]))
+
+    # Create arrays of raster coordinates.
+    s_coords = (jnp.arange(width) + 0.5) / width  # horizontal coordinate in [0,1]
+    t_coords = (jnp.arange(height) + 0.5) / height  # vertical coordinate in [0,1]
+
+    # Vectorize pixel_color over the image.
+    pixel_color_vmap = jax.vmap(lambda t: jax.vmap(lambda s: pixel_color(s, t))(s_coords), in_axes=0)
+    image = pixel_color_vmap(t_coords)
+    # The resulting image has shape (height, width, 3).
     return image
+

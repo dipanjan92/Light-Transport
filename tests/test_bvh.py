@@ -1,38 +1,67 @@
-from accelerators.bvh import BVHNode
+# debug_bvh.py
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+# Import your AABB and BVH definitions.
+from primitives.aabb import AABB, get_largest_dim, get_surface_area
+from accelerators.bvh import BVH, build_bvh
 
 
-def check_bound_intersects(this, other):
-    # Checks overlap in x, y and z directions. If overlap is there in all three directions, the boxes intersect
-    if this.min_point[0] <= other.max_point[0] and this.max_point[0] >= other.min_point[0] and \
-            this.min_point[1] <= other.max_point[1] and this.max_point[1] >= other.min_point[1] and \
-            this.min_point[2] <= other.max_point[2] and this.max_point[2] >= other.min_point[2]:
-        return True
-    return False
+# -----------------------------------------------------------------------------
+# Debugging functions for AABB and BVH
+# -----------------------------------------------------------------------------
+def debug_print_aabb(aabb: AABB):
+    """Print details about an AABB."""
+    print("  AABB:")
+    print("    Min bounds   :", aabb.min_point)
+    print("    Max bounds   :", aabb.max_point)
+    # Compute the centroid as the average of min and max.
+    centroid = (aabb.min_point + aabb.max_point) * 0.5
+    print("    Centroid     :", centroid)
+    diag = aabb.max_point - aabb.min_point
+    print("    Diagonal     :", diag)
+    surface_area = 2.0 * (diag[0] * diag[1] + diag[0] * diag[2] + diag[1] * diag[2])
+    print("    Surface Area :", surface_area)
+    # Using your helper, get the largest dimension (which is often used as the split axis).
+    largest_dim = int(get_largest_dim(aabb))
+    print("    Largest dim (split axis):", largest_dim)
 
 
-def check_bvh(node: BVHNode, primitives, depth=0, validate_bounds=False):
-    assert node is not None, "Node in the BVH tree is null"
-    if node.n_primitives > 0:  # leaf node
-        assert node.n_primitives <= len(primitives), "Node has more primitives than it should"
-        assert node.first_prim_offset < len(primitives), "Node first primitive offset is out of range"
-        if validate_bounds:
-            for i in range(node.first_prim_offset, node.first_prim_offset + node.n_primitives):
-                assert node.bounds.intersects(primitives[i].bounds), "Primitive not within node bounds"
-    else:  # interior node
-        assert node.child_0 is not None, "Child 0 of the node is null"
-        assert node.child_1 is not None, "Child 1 of the node is null"
-        assert node.split_axis is not None, "Split axis of the node is None"
-        check_bvh(node.child_0, primitives, depth + 1, validate_bounds)
-        check_bvh(node.child_1, primitives, depth + 1, validate_bounds)
-        if validate_bounds:
-            assert check_bound_intersects(node, node.child_0.bounds), "Child 0 not within node bounds"
-            assert check_bound_intersects(node, node.child_1.bounds), "Child 1 not within node bounds"
+def debug_print_bvh(bvh: BVH, node_index: int = None, depth: int = 0):
+    """
+    Recursively print the BVH structure.
+
+    Parameters:
+      bvh: A BVH instance (the custom dataclass we built).
+      node_index: current node index (start with the BVH root).
+      depth: current recursion depth (used for indentation).
+    """
+    if node_index is None:
+        node_index = int(bvh.root)
+    indent = "  " * depth
+
+    # Retrieve this node's bounding box.
+    aabb_min = bvh.aabb_mins[node_index]
+    aabb_max = bvh.aabb_maxs[node_index]
+    # Reconstruct an AABB instance for printing.
+    node_aabb = AABB(min_point=aabb_min, max_point=aabb_max, centroid=(aabb_min + aabb_max) * 0.5)
+
+    print(indent + f"Node {node_index}:")
+    debug_print_aabb(node_aabb)
+
+    left = int(bvh.lefts[node_index])
+    right = int(bvh.rights[node_index])
+    if left == -1 and right == -1:
+        # Leaf node.
+        tri_offset = int(bvh.tri_offsets[node_index])
+        tri_count = int(bvh.tri_counts[node_index])
+        print(indent + f"  Leaf node: tri_offset = {tri_offset}, tri_count = {tri_count}")
+    else:
+        # Internal node.
+        print(indent + f"  Internal node: left = {left}, right = {right}")
+        debug_print_bvh(bvh, node_index=left, depth=depth + 1)
+        debug_print_bvh(bvh, node_index=right, depth=depth + 1)
 
 
-def test_bvh(root, primitives, validate_bounds=False):
-    # Test the BVH tree
-    try:
-        check_bvh(root, primitives, validate_bounds=False)
-        print("BVH tree is correctly constructed.")
-    except AssertionError as e:
-        print("BVH tree is not correctly constructed:", e)
+
