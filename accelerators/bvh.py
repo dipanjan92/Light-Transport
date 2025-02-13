@@ -1,347 +1,511 @@
 # bvh.py
 import jax
 import jax.numpy as jnp
-from jax import tree_util
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Tuple, Any
+from jax import lax
 
-# Import the AABB functions from your aabb.py.
-from primitives.aabb import AABB, union, union_p, aabb_intersect
-from primitives.triangle import triangle_intersect
+# Global constants
+INF = 1e10
+MAX_DEPTH = 64  # maximum traversal stack depth
+MAX_LEAF_PRIMS = 16  # maximum number of primitives we loop over in a leaf
+
+# Import your other modules (make sure these modules are jittable)
+from primitives.aabb import AABB, union, union_p, aabb_intersect, aabb_hit_distance, aabb_intersect_p
 from primitives.intersects import Intersection, set_intersection
+from primitives.ray import Ray, spawn_ray
+from primitives.triangle import intersect_triangle  # Must be jittable
 
+# -------------------------------
+# Data Structures
+# -------------------------------
 
-# -----------------------------------------------------------------------------
-# BVH Node Definition (for the builder)
-# -----------------------------------------------------------------------------
 @dataclass
 class BVHNode:
-    """
-    A BVH node used during BVH construction. For an internal node, left and right
-    are indices (into the final flat node arrays) of its children. For a leaf node,
-    tri_offset and tri_count describe which triangles are stored in the leaf.
-    """
-    aabb_min: jnp.ndarray  # shape (3,)
-    aabb_max: jnp.ndarray  # shape (3,)
-    left: int  # index of left child (-1 for a leaf)
-    right: int  # index of right child (-1 for a leaf)
-    tri_offset: int  # if leaf, offset into the flat triangle index array
-    tri_count: int  # if leaf, number of triangles in this leaf
+    bounds: AABB = None
+    first_prim_offset: int = -1
+    n_primitives: int = 0
+    child_0: int = -1
+    child_1: int = -1
+    split_axis: int = -1
 
+    def init_leaf(self, first: int, n: int, box: AABB):
+        self.first_prim_offset = first
+        self.n_primitives = n
+        self.bounds = box
 
-# -----------------------------------------------------------------------------
-# Custom BVH Dataclass and PyTree Registration
-# -----------------------------------------------------------------------------
-@dataclass(frozen=True)
-class BVH:
-    """
-    BVH structure stored as flat JAX arrays.
-    Fields:
-      aabb_mins: (num_nodes, 3) array of node minimum coordinates.
-      aabb_maxs: (num_nodes, 3) array of node maximum coordinates.
-      lefts: (num_nodes,) array of left child indices (or -1 if leaf).
-      rights: (num_nodes,) array of right child indices (or -1 if leaf).
-      tri_offsets: (num_nodes,) array with the starting index in the leaf triangle list.
-      tri_counts: (num_nodes,) array with the number of triangles in the leaf.
-      leaf_tri_indices: (total_leaf_triangles,) array of triangle indices.
-      root: scalar int, index of the root node.
-    """
-    aabb_mins: jnp.ndarray
-    aabb_maxs: jnp.ndarray
-    lefts: jnp.ndarray
-    rights: jnp.ndarray
-    tri_offsets: jnp.ndarray
-    tri_counts: jnp.ndarray
-    leaf_tri_indices: jnp.ndarray
-    root: jnp.ndarray
+    def init_interior(self, axis: int, c0: int, c1: int, box: AABB):
+        self.child_0 = c0
+        self.child_1 = c1
+        self.split_axis = axis
+        self.bounds = box
+        self.n_primitives = 0
 
+@dataclass
+class LinearBVHNode:
+    bounds: AABB = None
+    primitives_offset: int = -1
+    second_child_offset: int = -1
+    n_primitives: int = 0
+    axis: int = -1
 
-def bvh_flatten(bvh: BVH):
-    children = (
-        bvh.aabb_mins,
-        bvh.aabb_maxs,
-        bvh.lefts,
-        bvh.rights,
-        bvh.tri_offsets,
-        bvh.tri_counts,
-        bvh.leaf_tri_indices,
-        bvh.root,
-    )
-    aux = None
-    return children, aux
+@dataclass
+class BucketInfo:
+    count: int = 0
+    bounds: AABB = None
 
+@dataclass
+class BuildParams:
+    n_triangles: int = 0
+    n_ordered_prims: int = 0
+    total_nodes: int = 0
+    split_method: int = 0
 
-def bvh_unflatten(aux, children):
-    return BVH(
-        aabb_mins=children[0],
-        aabb_maxs=children[1],
-        lefts=children[2],
-        rights=children[3],
-        tri_offsets=children[4],
-        tri_counts=children[5],
-        leaf_tri_indices=children[6],
-        root=children[7],
-    )
+# -------------------------------
+# Helper functions for the BVH build stack
+# -------------------------------
 
+def push(stack: List[Tuple[int, int, int, int]], start: int, end: int, parent_idx: int, is_second_child: int):
+    stack.append((start, end, parent_idx, is_second_child))
 
-tree_util.register_pytree_node(BVH, bvh_flatten, bvh_unflatten)
+def pop(stack: List[Tuple[int, int, int, int]]) -> Tuple[int, int, int, int]:
+    return stack.pop()
 
+# -------------------------------
+# Primitive Partitioning Helpers
+# -------------------------------
 
-# -----------------------------------------------------------------------------
-# BVH Builder Function
-# -----------------------------------------------------------------------------
-def build_bvh(triangles: dict, max_leaf_size: int = 4) -> BVH:
-    """
-    Build a BVH from triangle data. The triangles dictionary is expected to have
-    the following keys (each with shape (N,3)):
-       - "vertex_1"
-       - "vertex_2"
-       - "vertex_3"
-       - "centroid"
+def partition_equal_counts(bvh_primitives: List[Any], start: int, end: int, dim: int) -> int:
+    sublist = bvh_primitives[start:end]
+    sublist.sort(key=lambda prim: float(prim.bounds.centroid[dim]))
+    bvh_primitives[start:end] = sublist
+    mid = (start + end) // 2
+    return mid
 
-    This function computes a bounding box for each triangle and then builds a BVH
-    by recursively splitting the set of triangles (using a median-split along the
-    largest axis of the centroids). The resulting BVH is returned as a BVH instance.
+def partition_middle(bvh_primitives: List[Any], start: int, end: int, dim: int, centroid_bounds: AABB) -> int:
+    pmid = (centroid_bounds.min_point[dim] + centroid_bounds.max_point[dim]) / 2.0
+    left = start
+    right = end - 1
+    while left <= right:
+        while left <= right and float(bvh_primitives[left].bounds.centroid[dim]) < pmid:
+            left += 1
+        while left <= right and float(bvh_primitives[right].bounds.centroid[dim]) >= pmid:
+            right -= 1
+        if left < right:
+            bvh_primitives[left], bvh_primitives[right] = bvh_primitives[right], bvh_primitives[left]
+            left += 1
+            right -= 1
+    mid = left
+    if mid == start or mid == end:
+        mid = (start + end) // 2
+    return mid
 
-    Parameters:
-      triangles: dictionary of triangle arrays.
-      max_leaf_size: maximum number of triangles per leaf.
+def partition_sah(bvh_primitives: List[Any],
+                  start: int,
+                  end: int,
+                  dim: int,
+                  centroid_bounds: AABB,
+                  costs: List[float],
+                  buckets: List[BucketInfo],
+                  bounds: AABB,
+                  max_prims_in_node: int) -> int:
+    nBuckets = 12
+    nSplits = nBuckets - 1
+    minCostSplitBucket = -1
+    minCost = INF
+    leafCost = (end - start)
+    for b in range(nBuckets):
+        buckets[b].count = 0
+        buckets[b].bounds = AABB(jnp.array([INF, INF, INF]),
+                                  jnp.array([-INF, -INF, -INF]),
+                                  jnp.array([0.0, 0.0, 0.0]))
+    for i in range(start, end):
+        centroid = bvh_primitives[i].bounds.centroid
+        denom = float(centroid_bounds.max_point[dim] - centroid_bounds.min_point[dim])
+        b_idx = 0 if denom == 0 else int(nBuckets * (float(centroid[dim]) - float(centroid_bounds.min_point[dim])) / denom)
+        if b_idx == nBuckets:
+            b_idx = nBuckets - 1
+        buckets[b_idx].count += 1
+        buckets[b_idx].bounds = union(buckets[b_idx].bounds, bvh_primitives[i].bounds)
+    countBelow = 0
+    countAbove = 0
+    boundBelow = AABB(jnp.array([INF, INF, INF]),
+                      jnp.array([-INF, -INF, -INF]),
+                      jnp.array([0.0, 0.0, 0.0]))
+    boundAbove = AABB(jnp.array([INF, INF, INF]),
+                      jnp.array([-INF, -INF, -INF]),
+                      jnp.array([0.0, 0.0, 0.0]))
+    for j in range(nSplits):
+        boundBelow = union(boundBelow, buckets[j].bounds)
+        countBelow += buckets[j].count
+        costs[j] = countBelow * boundBelow.get_surface_area()
+    for k in range(nSplits - 1, -1, -1):
+        boundAbove = union(boundAbove, buckets[k + 1].bounds)
+        countAbove += buckets[k + 1].count
+        costs[k] += countAbove * boundAbove.get_surface_area()
+    for m in range(nSplits):
+        if costs[m] < minCost:
+            minCost = costs[m]
+            minCostSplitBucket = m
+    minCost = minCost / bounds.get_surface_area() if bounds.get_surface_area() != 0 else INF
+    mid = start
+    if (end - start) > max_prims_in_node or minCost < leafCost:
+        mid = start
+        for n in range(start, end):
+            centroid = bvh_primitives[n].bounds.centroid
+            denom = float(centroid_bounds.max_point[dim] - centroid_bounds.min_point[dim])
+            b_idx = 0 if denom == 0 else int(nBuckets * (float(centroid[dim]) - float(centroid_bounds.min_point[dim])) / denom)
+            if b_idx == nBuckets:
+                b_idx = nBuckets - 1
+            if b_idx <= minCostSplitBucket:
+                bvh_primitives[mid], bvh_primitives[n] = bvh_primitives[n], bvh_primitives[mid]
+                mid += 1
+    else:
+        mid = start
+    return mid
 
-    Returns:
-      A BVH instance containing flat arrays:
-         - aabb_mins: (num_nodes, 3) array.
-         - aabb_maxs: (num_nodes, 3) array.
-         - lefts: (num_nodes,) array.
-         - rights: (num_nodes,) array.
-         - tri_offsets: (num_nodes,) array.
-         - tri_counts: (num_nodes,) array.
-         - leaf_tri_indices: (total_leaf_triangles,) array.
-         - root: scalar int (as a jnp.array).
-    """
-    # Number of triangles.
-    N = triangles["vertex_1"].shape[0]
-    # Compute triangle bounding boxes.
-    v0 = triangles["vertex_1"]
-    v1 = triangles["vertex_2"]
-    v2 = triangles["vertex_3"]
-    tri_mins = jnp.minimum(jnp.minimum(v0, v1), v2)
-    tri_maxs = jnp.maximum(jnp.maximum(v0, v1), v2)
-    centroids = triangles["centroid"]
+# -------------------------------
+# BVH Build and Flatten Routines
+# -------------------------------
 
-    # For the builder, we convert to NumPy arrays.
-    import numpy as np
-    tri_mins_np = np.array(tri_mins)
-    tri_maxs_np = np.array(tri_maxs)
-    centroids_np = np.array(centroids)
-    indices = np.arange(N)
-
-    # Lists to collect the built BVH nodes and leaf triangle indices.
+def build_bvh(primitives: List[Any],
+              bvh_primitives: List[Any],
+              _start: int,
+              _end: int,
+              ordered_prims: List[Any],
+              split_method: int) -> Tuple[List[BVHNode], List[Any]]:
     nodes: List[BVHNode] = []
-    leaf_tri_indices: List[int] = []
-
-    def recursive_build(tri_indices: np.ndarray) -> int:
-        """
-        Recursively build the BVH and return the index of the current node in the
-        nodes list.
-        """
-        # Compute the bounding box for the current set of triangles.
-        bbox_min = np.min(tri_mins_np[tri_indices], axis=0)
-        bbox_max = np.max(tri_maxs_np[tri_indices], axis=0)
-
-        # If we have few triangles, create a leaf node.
-        if len(tri_indices) <= max_leaf_size:
-            tri_offset = len(leaf_tri_indices)
-            tri_count = len(tri_indices)
-            leaf_tri_indices.extend(tri_indices.tolist())
-            node = BVHNode(
-                aabb_min=jnp.array(bbox_min),
-                aabb_max=jnp.array(bbox_max),
-                left=-1,
-                right=-1,
-                tri_offset=tri_offset,
-                tri_count=tri_count
-            )
-            nodes.append(node)
-            return len(nodes) - 1
-
-        # Otherwise, split the triangle set.
-        extent = bbox_max - bbox_min
-        axis = np.argmax(extent)
-        # Sort the triangle indices according to the centroid coordinate along the chosen axis.
-        sorted_order = np.argsort(centroids_np[tri_indices, axis])
-        sorted_indices = tri_indices[sorted_order]
-        mid = len(sorted_indices) // 2
-        left_indices = sorted_indices[:mid]
-        right_indices = sorted_indices[mid:]
-        # Recursively build children.
-        left_child = recursive_build(left_indices)
-        right_child = recursive_build(right_indices)
-        # The current node’s bounding box is the union of its children.
-        left_bbox_min = np.array(nodes[left_child].aabb_min)
-        right_bbox_min = np.array(nodes[right_child].aabb_min)
-        left_bbox_max = np.array(nodes[left_child].aabb_max)
-        right_bbox_max = np.array(nodes[right_child].aabb_max)
-        node_bbox_min = np.minimum(left_bbox_min, right_bbox_min)
-        node_bbox_max = np.maximum(left_bbox_max, right_bbox_max)
-        node = BVHNode(
-            aabb_min=jnp.array(node_bbox_min),
-            aabb_max=jnp.array(node_bbox_max),
-            left=left_child,
-            right=right_child,
-            tri_offset=-1,
-            tri_count=0
-        )
+    total_nodes = 0
+    ordered_prims_idx = 0
+    stack: List[Tuple[int, int, int, int]] = []
+    push(stack, _start, _end, -1, 0)
+    max_prims_in_node = max(4, int(0.1 * len(bvh_primitives)))
+    costs = [0.0] * 12
+    buckets = [BucketInfo(0, AABB(jnp.array([INF, INF, INF]),
+                                  jnp.array([-INF, -INF, -INF]),
+                                  jnp.array([0.0, 0.0, 0.0])))
+               for _ in range(12)]
+    while stack:
+        start, end, parent_idx, is_second_child = pop(stack)
+        current_node_idx = total_nodes
+        total_nodes += 1
+        node = BVHNode()
         nodes.append(node)
-        return len(nodes) - 1
+        if parent_idx != -1:
+            if is_second_child:
+                nodes[parent_idx].child_1 = current_node_idx
+            else:
+                nodes[parent_idx].child_0 = current_node_idx
+        bounds = AABB(jnp.array([INF, INF, INF]),
+                      jnp.array([-INF, -INF, -INF]),
+                      jnp.array([0.0, 0.0, 0.0]))
+        for i in range(start, end):
+            bounds = union(bounds, bvh_primitives[i].bounds)
+        if bounds.get_surface_area() == 0 or (end - start) == 1:
+            first_prim_offset = ordered_prims_idx
+            for i in range(start, end):
+                prim_num = bvh_primitives[i].prim_num
+                ordered_prims.append(primitives[prim_num])
+                ordered_prims_idx += 1
+            node.init_leaf(first_prim_offset, end - start, bounds)
+        else:
+            centroid_bounds = AABB(jnp.array([INF, INF, INF]),
+                                   jnp.array([-INF, -INF, -INF]),
+                                   jnp.array([0.0, 0.0, 0.0]))
+            for i in range(start, end):
+                centroid_bounds = union_p(centroid_bounds, bvh_primitives[i].bounds.centroid)
+            diff = centroid_bounds.max_point - centroid_bounds.min_point
+            dim = int(jnp.argmax(diff))
+            if float(centroid_bounds.max_point[dim]) == float(centroid_bounds.min_point[dim]):
+                first_prim_offset = ordered_prims_idx
+                for i in range(start, end):
+                    prim_num = bvh_primitives[i].prim_num
+                    ordered_prims.append(primitives[prim_num])
+                    ordered_prims_idx += 1
+                node.init_leaf(first_prim_offset, end - start, bounds)
+            else:
+                mid = (start + end) // 2
+                if split_method == 2:
+                    mid = partition_equal_counts(bvh_primitives, start, end, dim)
+                elif split_method == 1:
+                    mid = partition_middle(bvh_primitives, start, end, dim, centroid_bounds)
+                elif split_method == 0:
+                    if (end - start) <= 2:
+                        mid = partition_equal_counts(bvh_primitives, start, end, dim)
+                    else:
+                        mid = partition_sah(bvh_primitives, start, end, dim, centroid_bounds, costs, buckets, bounds, max_prims_in_node)
+                node.split_axis = dim
+                node.n_primitives = 0
+                node.bounds = bounds
+                push(stack, mid, end, current_node_idx, 1)
+                push(stack, start, mid, current_node_idx, 0)
+    return nodes, ordered_prims
 
-    # Build the BVH tree starting from all triangle indices.
-    root_index = recursive_build(indices)
+def flatten_bvh(nodes: List[BVHNode], root: int) -> List[LinearBVHNode]:
+    linear_bvh: List[LinearBVHNode] = []
+    stack: List[Tuple[int, int, int]] = []
+    stack.append((root, -1, 0))
+    offset = 0
+    while stack:
+        node_idx, parent_idx, is_second_child = stack.pop()
+        if node_idx == -1:
+            continue
+        current_idx = offset
+        linear_node = LinearBVHNode()
+        linear_node.bounds = nodes[node_idx].bounds
+        linear_node.primitives_offset = nodes[node_idx].first_prim_offset
+        linear_node.n_primitives = nodes[node_idx].n_primitives
+        linear_node.axis = nodes[node_idx].split_axis
+        linear_node.second_child_offset = nodes[node_idx].child_1  # child_1 stores second child index
+        linear_bvh.append(linear_node)
+        offset += 1
+        if parent_idx != -1 and is_second_child:
+            linear_bvh[parent_idx].second_child_offset = current_idx
+        if nodes[node_idx].n_primitives == 0:
+            if nodes[node_idx].child_1 != -1:
+                stack.append((nodes[node_idx].child_1, current_idx, 1))
+            if nodes[node_idx].child_0 != -1:
+                stack.append((nodes[node_idx].child_0, current_idx, 0))
+    return linear_bvh
 
-    # Convert the list of leaf triangle indices to a JAX array.
-    leaf_tri_indices_arr = jnp.array(leaf_tri_indices, dtype=jnp.int32)
+# -------------------------------
+# Packed BVH and Primitive Helpers
+# -------------------------------
 
-    # Now, flatten the nodes list into arrays.
-    num_nodes = len(nodes)
-    aabb_mins = jnp.stack([node.aabb_min for node in nodes])  # (num_nodes, 3)
-    aabb_maxs = jnp.stack([node.aabb_max for node in nodes])  # (num_nodes, 3)
-    lefts = jnp.array([node.left for node in nodes], dtype=jnp.int32)
-    rights = jnp.array([node.right for node in nodes], dtype=jnp.int32)
-    tri_offsets = jnp.array([node.tri_offset for node in nodes], dtype=jnp.int32)
-    tri_counts = jnp.array([node.tri_count for node in nodes], dtype=jnp.int32)
+def pack_linear_bvh(linear_bvh: List[LinearBVHNode]) -> dict:
+    n = len(linear_bvh)
+    bounds_min = jnp.stack([node.bounds.min_point for node in linear_bvh], axis=0)
+    bounds_max = jnp.stack([node.bounds.max_point for node in linear_bvh], axis=0)
+    bounds_centroid = jnp.stack([node.bounds.centroid for node in linear_bvh], axis=0)
+    primitives_offset = jnp.array([node.primitives_offset for node in linear_bvh], dtype=jnp.int32)
+    n_primitives = jnp.array([node.n_primitives for node in linear_bvh], dtype=jnp.int32)
+    second_child_offset = jnp.array([node.second_child_offset for node in linear_bvh], dtype=jnp.int32)
+    axis = jnp.array([node.axis for node in linear_bvh], dtype=jnp.int32)
+    # Assume that the first child is always stored as child_0 = current + 1
+    child_0 = jnp.arange(n, dtype=jnp.int32) + 1
+    return {
+        "bounds_min": bounds_min,
+        "bounds_max": bounds_max,
+        "bounds_centroid": bounds_centroid,
+        "primitives_offset": primitives_offset,
+        "n_primitives": n_primitives,
+        "second_child_offset": second_child_offset,
+        "axis": axis,
+        "child_0": child_0
+    }
 
-    # Pack the BVH data into our BVH dataclass.
-    bvh = BVH(
-        aabb_mins=aabb_mins,
-        aabb_maxs=aabb_maxs,
-        lefts=lefts,
-        rights=rights,
-        tri_offsets=tri_offsets,
-        tri_counts=tri_counts,
-        leaf_tri_indices=leaf_tri_indices_arr,
-        root=jnp.array(root_index, dtype=jnp.int32)
+def pack_primitives(primitives: List[Any]) -> dict:
+    keys = primitives[0].keys()
+    packed = {}
+    for key in keys:
+        packed[key] = jnp.stack([prim[key] for prim in primitives], axis=0)
+    return packed
+
+# -------------------------------
+# BVH Intersection Routines (Fully Jitted)
+# -------------------------------
+
+@jax.jit
+def intersect_bvh(ray: Ray, primitives: dict, bvh: dict, t_max: float) -> Intersection:
+    """
+    Intersect a ray with a BVH (packed in a dictionary) following a PBRT–style
+    iterative traversal. The BVH dictionary is assumed to have the following keys:
+      - "bounds_min":   (N,3) array of node minimum bounds.
+      - "bounds_max":   (N,3) array of node maximum bounds.
+      - "n_primitives": (N,) array (int32) indicating the number of primitives in a leaf.
+      - "primitives_offset": (N,) array (int32) indicating the starting index in the
+                             primitives array for a leaf.
+      - "axis":         (N,) array (int32) indicating the split axis (for interior nodes).
+      - "second_child_offset": (N,) array (int32) for the second child of an interior node.
+
+    The primitives dictionary is assumed to contain triangle data under keys "v0", "v1", "v2".
+    (The triangle intersection function should return a tuple (hit, t_candidate).)
+
+    The function returns an Intersection record (with intersected==0 if no hit was found).
+    """
+    # Precompute ray data.
+    invDir = 1.0 / ray.direction
+    # Create an array of booleans (or 0/1 ints) indicating if each component is negative.
+    dirIsNeg = jnp.array([invDir[0] < 0, invDir[1] < 0, invDir[2] < 0])
+
+    # Initialize the intersection record with no hit (t_max).
+    init_hit = Intersection(
+        min_distance=t_max,
+        intersected_point=ray.origin,
+        normal=jnp.array([0.0, 0.0, 0.0]),
+        shading_normal=jnp.array([0.0, 0.0, 0.0]),
+        dpdu=jnp.array([0.0, 0.0, 0.0]),
+        dpdv=jnp.array([0.0, 0.0, 0.0]),
+        dndu=jnp.array([0.0, 0.0, 0.0]),
+        dndv=jnp.array([0.0, 0.0, 0.0]),
+        nearest_object=-1,
+        intersected=0
     )
-    return bvh
+
+    # Initialize the traversal state.
+    # state = (currentNodeIndex, toVisitOffset, stack, tMax, intersection, nodesVisited)
+    currentNodeIndex = jnp.int32(0)
+    toVisitOffset = jnp.int32(0)
+    # Allocate a fixed-size stack; fill with -1.
+    stack = -jnp.ones((MAX_DEPTH,), dtype=jnp.int32)
+    nodesVisited = jnp.int32(0)
+    state = (currentNodeIndex, toVisitOffset, stack, t_max, init_hit, nodesVisited)
+
+    def cond_fn(state):
+        curr, toVisit, stack, tCurr, inter, nodesVis = state
+        # Continue while there is a valid current node.
+        return curr != -1
+
+    def body_fn(state):
+        curr, toVisit, stack, tCurr, inter, nodesVis = state
+        nodesVis = nodesVis + 1
+
+        # Load the current node’s data from the packed BVH.
+        node_bounds_min = bvh["bounds_min"][curr]
+        node_bounds_max = bvh["bounds_max"][curr]
+        node_nPrims = bvh["n_primitives"][curr]
+        node_axis = bvh["axis"][curr]  # valid for interior nodes
+        node_secondChild = bvh["second_child_offset"][curr]
+
+        # Test intersection of the ray with the node’s bounding box.
+        hitAABB = aabb_intersect_p(ray.origin, ray.direction, tCurr,
+                                   invDir, dirIsNeg,
+                                   node_bounds_min, node_bounds_max)
+
+        # If the ray hits the node’s bounds…
+        def if_hit(_):
+            # If this is a leaf node, test all primitives.
+            def if_leaf(_):
+                # For leaves, loop over the primitives in the node.
+                prim_offset = bvh["primitives_offset"][curr]
+
+                # We'll use a fori_loop to accumulate the best hit.
+                def leaf_body(i, carry):
+                    best_inter, best_t = carry
+                    primIdx = prim_offset + i
+                    v0 = primitives["v0"][primIdx]
+                    v1 = primitives["v1"][primIdx]
+                    v2 = primitives["v2"][primIdx]
+                    hit_prim, t_candidate = intersect_triangle(
+                        ray.origin, ray.direction, v0, v1, v2, best_t)
+
+                    # If this primitive is hit, update the intersection record.
+                    def update_hit(_):
+                        return set_intersection(ray.origin, ray.direction, v0, v1, v2, t_candidate)
+
+                    new_inter = lax.cond(hit_prim, update_hit, lambda _: best_inter, operand=None)
+                    new_t = jnp.minimum(best_t, lax.select(hit_prim, t_candidate, best_t))
+                    return (new_inter, new_t)
+
+                best_inter, best_t = lax.fori_loop(0, node_nPrims, leaf_body, (inter, tCurr))
+
+                # After testing the leaf, pop the next node from the stack (if any).
+                def pop_stack(_):
+                    new_toVisit = toVisit - 1
+                    new_curr = stack[new_toVisit]
+                    return new_curr, new_toVisit
+
+                new_curr, new_toVisit = lax.cond(toVisit == 0,
+                                                 lambda _: (jnp.int32(-1), toVisit),
+                                                 pop_stack,
+                                                 operand=None)
+                return new_curr, new_toVisit, stack, best_t, best_inter, nodesVis
+
+            # Otherwise, interior node.
+            def if_interior(_):
+                # For interior nodes, choose which child is near.
+                # (In PBRT, the ordering depends on the sign of the ray direction along the split axis.)
+                def if_neg(dummy):
+                    # If the ray direction is negative along node_axis:
+                    new_stack = stack.at[toVisit].set(curr + 1)
+                    new_toVisit = toVisit + 1
+                    new_curr = node_secondChild
+                    return new_curr, new_toVisit, new_stack
+
+                def if_not_neg(dummy):
+                    new_stack = stack.at[toVisit].set(node_secondChild)
+                    new_toVisit = toVisit + 1
+                    new_curr = curr + 1
+                    return new_curr, new_toVisit, new_stack
+
+                new_curr, new_toVisit, new_stack = lax.cond(dirIsNeg[node_axis],
+                                                            if_neg,
+                                                            if_not_neg,
+                                                            operand=None)
+                return new_curr, new_toVisit, new_stack, tCurr, inter, nodesVis
+
+            return lax.cond(node_nPrims > 0, if_leaf, if_interior, operand=None)
+
+        # If the ray misses the node’s bounds, simply pop the next node.
+        def if_miss(_):
+            def pop_stack(_):
+                new_toVisit = toVisit - 1
+                new_curr = stack[new_toVisit]
+                return new_curr, new_toVisit
+
+            new_curr, new_toVisit = lax.cond(toVisit == 0,
+                                             lambda _: (jnp.int32(-1), toVisit),
+                                             pop_stack,
+                                             operand=None)
+            return new_curr, new_toVisit, stack, tCurr, inter, nodesVis
+
+        return lax.cond(hitAABB, if_hit, if_miss, operand=None)
+
+    final_state = lax.while_loop(cond_fn, body_fn, state)
+    # final_state is (curr, toVisit, stack, tBest, intersection, nodesVisited)
+    return final_state[4]
 
 
-# -----------------------------------------------------------------------------
-# BVH Traversal: intersect_bvh
-# -----------------------------------------------------------------------------
-def intersect_bvh(ray_origin: jnp.ndarray,
-                  ray_direction: jnp.ndarray,
-                  bvh: BVH,
-                  triangles: dict,
-                  t_max: float) -> Intersection:
-    """
-    Traverse the BVH and intersect the ray with the scene.
+def unoccluded(isec_p: jnp.ndarray,
+               isec_n: jnp.ndarray,
+               target_p: jnp.ndarray,
+               primitives: dict,
+               bvh: dict,
+               shadow_epsilon: float = 0.0001) -> bool:
+    direction = jax.nn.normalize(target_p - isec_p)
+    distance = jnp.linalg.norm(target_p - isec_p) * (1 - shadow_epsilon)
+    ray = spawn_ray(isec_p, isec_n, direction)
+    intersection = intersect_bvh(ray, primitives, bvh, 0, distance)
+    return intersection.intersected == 1
 
-    Parameters:
-      ray_origin: (3,) array with the ray origin.
-      ray_direction: (3,) array with the ray direction.
-      bvh: BVH instance.
-      triangles: dictionary of triangle arrays (keys: "vertex_1", "vertex_2", "vertex_3").
-      t_max: maximum allowed intersection distance.
+# -------------------------------
+# BVH Primitive Helper Classes and Creation
+# -------------------------------
 
-    Returns:
-      An Intersection object corresponding to the nearest hit.
-    """
-    # Get triangle arrays.
-    v0_all = triangles["vertex_1"]
-    v1_all = triangles["vertex_2"]
-    v2_all = triangles["vertex_3"]
+class BVHPrimitive:
+    def __init__(self, prim_num, bounds):
+        self.prim_num = prim_num
+        self.bounds = bounds
 
-    # Allocate a fixed-size stack (size = number of BVH nodes).
-    max_stack = bvh.aabb_mins.shape[0]
-    stack = jnp.full((max_stack,), -1, dtype=jnp.int32)
-    stack = stack.at[0].set(bvh.root)
-    stack_ptr = jnp.array(1, dtype=jnp.int32)
-    best_t = t_max
-    best_isec = Intersection()  # Default intersection (with min_distance=t_max, etc.)
+def compute_triangle_bounds(v1, v2, v3):
+    min_point = jnp.minimum(jnp.minimum(v1, v2), v3)
+    max_point = jnp.maximum(jnp.maximum(v1, v2), v3)
+    centroid = (min_point + max_point) / 2.0
+    return AABB(min_point, max_point, centroid)
 
-    # Loop state: (stack, stack_ptr, best_t, best_isec)
-    state = (stack, stack_ptr, best_t, best_isec)
+def create_bvh_primitives(triangles):
+    num = int(triangles["vertex_1"].shape[0])
+    bvh_prims = []
+    for i in range(num):
+        v1 = triangles["vertex_1"][i]
+        v2 = triangles["vertex_2"][i]
+        v3 = triangles["vertex_3"][i]
+        bounds = compute_triangle_bounds(v1, v2, v3)
+        bvh_prims.append(BVHPrimitive(i, bounds))
+    return bvh_prims
 
-    def cond_fun(state):
-        _, stack_ptr, _, _ = state
-        return stack_ptr > 0
-
-    def body_fun(state):
-        stack, stack_ptr, best_t, best_isec = state
-        # Pop a node index from the stack.
-        node_index = stack[stack_ptr - 1]
-        stack_ptr = stack_ptr - 1
-
-        # Reconstruct the node's AABB.
-        aabb_min = bvh.aabb_mins[node_index]
-        aabb_max = bvh.aabb_maxs[node_index]
-        node_aabb = AABB(min_point=aabb_min, max_point=aabb_max, centroid=(aabb_min + aabb_max) * 0.5)
-        hit_aabb = aabb_intersect(node_aabb, ray_origin, ray_direction)
-        state = (stack, stack_ptr, best_t, best_isec)
-        state = jax.lax.cond(hit_aabb,
-                             lambda s: process_node(s, node_index),
-                             lambda s: s,
-                             operand=state)
-        return state
-
-    def process_node(state, node_index):
-        stack, stack_ptr, best_t, best_isec = state
-        left = bvh.lefts[node_index]
-        right = bvh.rights[node_index]
-        tri_offset = bvh.tri_offsets[node_index]
-        tri_count = bvh.tri_counts[node_index]
-
-        def leaf_fn(state):
-            # Process leaf: iterate over the triangles in this leaf.
-            def leaf_body(i, state_inner):
-                stack, stack_ptr, best_t, best_isec = state_inner
-                tri_index = bvh.leaf_tri_indices[tri_offset + i]
-                v0_tri = v0_all[tri_index]
-                v1_tri = v1_all[tri_index]
-                v2_tri = v2_all[tri_index]
-                hit, t = triangle_intersect(ray_origin, ray_direction, v0_tri, v1_tri, v2_tri, best_t)
-
-                def update_fn(_):
-                    new_isec = set_intersection(ray_origin, ray_direction, v0_tri, v1_tri, v2_tri, t)
-                    return (stack, stack_ptr, t, new_isec)
-
-                return jax.lax.cond(hit & (t < best_t),
-                                    update_fn,
-                                    lambda _: (stack, stack_ptr, best_t, best_isec),
-                                    operand=None)
-
-            return jax.lax.fori_loop(0, tri_count, leaf_body, state)
-
-        def internal_fn(state):
-            # For an internal node, push both children onto the stack.
-            stack, stack_ptr, best_t, best_isec = state
-            stack = stack.at[stack_ptr].set(left)
-            stack = stack.at[stack_ptr + 1].set(right)
-            stack_ptr = stack_ptr + 2
-            return (stack, stack_ptr, best_t, best_isec)
-
-        is_leaf = jnp.logical_and(left == -1, right == -1)
-        state = jax.lax.cond(is_leaf, leaf_fn, internal_fn, operand=state)
-        return state
-
-    final_state = jax.lax.while_loop(cond_fun, body_fun, state)
-    _, _, best_t, best_isec = final_state
-    return best_isec
-
-# -----------------------------------------------------------------------------
-# Example Usage:
-#
-# Assuming you have already loaded triangles via your io.py and built the triangle arrays:
-#
-#   from io import load_obj, create_triangle_arrays
-#   vertices, faces = load_obj("path/to/model.obj")
-#   triangles = create_triangle_arrays(vertices, faces)
-#
-# Then you can build the BVH as follows:
-#
-#   from bvh import build_bvh, intersect_bvh
-#   bvh_instance = build_bvh(triangles, max_leaf_size=4)
-#   ray_origin = jnp.array([0.0, 0.0, -5.0])
-#   ray_direction = jnp.array([0.0, 0.0, 1.0])
-#   isec = intersect_bvh(ray_origin, ray_direction, bvh_instance, triangles, t_max=1e10)
-#
-# The resulting Intersection object, 'isec', holds the hit information.
-# -----------------------------------------------------------------------------
+def create_primitives(triangles):
+    num = int(triangles["vertex_1"].shape[0])
+    prims = []
+    for i in range(num):
+        prim = {
+            "v0": triangles["vertex_1"][i],
+            "v1": triangles["vertex_2"][i],
+            "v2": triangles["vertex_3"][i],
+            "centroid": triangles["centroid"][i],
+            "normal": triangles["normal"][i],
+            "edge_1": triangles["edge_1"][i],
+            "edge_2": triangles["edge_2"][i]
+        }
+        prims.append(prim)
+    return prims

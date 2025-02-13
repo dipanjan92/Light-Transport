@@ -4,13 +4,11 @@ import jax.numpy as jnp
 from dataclasses import dataclass, field
 from jax import tree_util
 
-# Define a large constant for infinity.
 INF = 1e10
 
 @dataclass(frozen=True)
 class Intersection:
-    # Now these fields are jnp.ndarray types, not Python scalars.
-    min_distance: jnp.ndarray = field(default_factory=lambda: jnp.array(INF, dtype=jnp.float32))
+    min_distance: float = INF
     intersected_point: jnp.ndarray = field(default_factory=lambda: jnp.zeros(3, dtype=jnp.float32))
     normal: jnp.ndarray = field(default_factory=lambda: jnp.zeros(3, dtype=jnp.float32))
     shading_normal: jnp.ndarray = field(default_factory=lambda: jnp.zeros(3, dtype=jnp.float32))
@@ -18,8 +16,8 @@ class Intersection:
     dpdv: jnp.ndarray = field(default_factory=lambda: jnp.zeros(3, dtype=jnp.float32))
     dndu: jnp.ndarray = field(default_factory=lambda: jnp.zeros(3, dtype=jnp.float32))
     dndv: jnp.ndarray = field(default_factory=lambda: jnp.zeros(3, dtype=jnp.float32))
-    nearest_object: jnp.ndarray = field(default_factory=lambda: jnp.array(-1, dtype=jnp.int32))
-    intersected: jnp.ndarray = field(default_factory=lambda: jnp.array(0, dtype=jnp.int32))
+    nearest_object: int = -1
+    intersected: int = 0
 
 @jax.jit
 def set_intersection(ray_origin: jnp.ndarray,
@@ -28,10 +26,6 @@ def set_intersection(ray_origin: jnp.ndarray,
                      v1: jnp.ndarray,
                      v2: jnp.ndarray,
                      t: float) -> Intersection:
-    """
-    Given a ray (with origin and direction) and triangle vertices (v0, v1, v2),
-    create a new Intersection instance when an intersection occurs at distance t.
-    """
     new_intersected_point = ray_origin + t * ray_direction
     edge1 = v1 - v0
     edge2 = v2 - v0
@@ -44,7 +38,7 @@ def set_intersection(ray_origin: jnp.ndarray,
         operand=norm
     )
     return Intersection(
-        min_distance=jnp.array(t, dtype=jnp.float32),
+        min_distance=t,
         intersected_point=new_intersected_point,
         normal=normal,
         shading_normal=normal,
@@ -52,11 +46,9 @@ def set_intersection(ray_origin: jnp.ndarray,
         dpdv=edge2,
         dndu=jnp.zeros(3, dtype=jnp.float32),
         dndv=jnp.zeros(3, dtype=jnp.float32),
-        nearest_object=jnp.array(-1, dtype=jnp.int32),
-        intersected=jnp.array(1, dtype=jnp.int32),
+        nearest_object=-1,
+        intersected=1,
     )
-
-# === PyTree Registration ===
 
 def _intersection_flatten(isec: Intersection):
     children = (isec.min_distance,
