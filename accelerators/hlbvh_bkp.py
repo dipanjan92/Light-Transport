@@ -5,9 +5,20 @@ from typing import Tuple, List
 from jax import lax
 
 # Import your existing BVHNode and AABB definitions.
-# Here we import the BVHNode and LinearBVHNode definitions from your original pipeline.
-from accelerators.bvh import BVHNode, LinearBVHNode
+# (Ensure that your AABB union functions expect a valid AABB rather than None.)
+from accelerators.bvh import BVHNode  # This is the same BVHNode used in your original pipeline.
 from primitives.aabb import AABB, get_surface_area, union, union_p
+
+# ------------------------------------------------------------------
+# Data structure for the linear BVH.
+# ------------------------------------------------------------------
+@dataclass
+class LinearBVHNode:
+    bounds: AABB = None
+    primitives_offset: int = -1
+    second_child_offset: int = -1
+    n_primitives: int = 0
+    axis: int = -1
 
 # ------------------------------------------------------------------
 # Utility: Create an empty AABB for accumulation.
@@ -87,7 +98,6 @@ def interval_pred(morton_codes: jnp.ndarray, mask: int, i: int) -> bool:
 # ------------------------------------------------------------------
 def build_upper_sah(treelet_roots: List[BVHNode], start: int, end: int,
                     total_nodes: List[int]) -> BVHNode:
-    # This routine is similar to your original BVH version.
     assert start < end, "start should be less than end"
     n_nodes = end - start
     if n_nodes == 1:
@@ -263,8 +273,8 @@ def build_hlbvh(primitives: List[dict],
 # ------------------------------------------------------------------
 # Flattening the BVH tree.
 #
-# This routine traverses the HLBVH tree (whose child pointers are BVHNode objects)
-# and produces a flat list of LinearBVHNode records (compatible with your original pipeline).
+# This routine traverses the HLBVH tree (whose child pointers are BVHNode objects,
+# not integer indices) and produces a flat list of LinearBVHNode records.
 # ------------------------------------------------------------------
 def flatten_bvh_tree(node: BVHNode, linear_bvh: List[LinearBVHNode]) -> int:
     current_idx = len(linear_bvh)
@@ -273,18 +283,19 @@ def flatten_bvh_tree(node: BVHNode, linear_bvh: List[LinearBVHNode]) -> int:
     linear_node.primitives_offset = node.first_prim_offset
     linear_node.n_primitives = node.n_primitives
     linear_node.axis = node.split_axis
-    # Set second_child_offset to -1 by default.
+    # We will fill in second_child_offset if this node is interior.
     linear_node.second_child_offset = -1
     linear_bvh.append(linear_node)
     # If this is an interior node, recursively flatten its children.
     if node.n_primitives == 0:
         left_idx = flatten_bvh_tree(node.child_0, linear_bvh) if isinstance(node.child_0, BVHNode) else -1
         right_idx = flatten_bvh_tree(node.child_1, linear_bvh) if isinstance(node.child_1, BVHNode) else -1
-        # In our linear representation, we assume that the first child is stored immediately after this node.
+        # In the linear representation, we assume the first child is stored at current_idx+1.
+        # Set second_child_offset to the index of the right child.
         linear_bvh[current_idx].second_child_offset = right_idx
     return current_idx
 
-def flatten_bvh(root: BVHNode) -> List[LinearBVHNode]:
+def flatten_bvh(root: BVHNode, dummy: int = 0) -> List[LinearBVHNode]:
     linear_bvh: List[LinearBVHNode] = []
     flatten_bvh_tree(root, linear_bvh)
     return linear_bvh
@@ -323,21 +334,59 @@ def pack_primitives(primitives: List[dict]) -> dict:
 
 
 
+# -------------------------------
+# BVH Primitive Helper Classes and Creation
+# -------------------------------
+class BVHPrimitive:
+    def __init__(self, prim_num, bounds):
+        self.prim_num = prim_num
+        self.bounds = bounds
+
+def compute_triangle_bounds(v1, v2, v3):
+    min_point = jnp.minimum(jnp.minimum(v1, v2), v3)
+    max_point = jnp.maximum(jnp.maximum(v1, v2), v3)
+    centroid = (min_point + max_point) / 2.0
+    return AABB(min_point, max_point, centroid)
+
+def create_bvh_primitives(triangles):
+    num = int(triangles["vertex_1"].shape[0])
+    bvh_prims = []
+    for i in range(num):
+        v1 = triangles["vertex_1"][i]
+        v2 = triangles["vertex_2"][i]
+        v3 = triangles["vertex_3"][i]
+        bounds = compute_triangle_bounds(v1, v2, v3)
+        bvh_prims.append(BVHPrimitive(i, bounds))
+    return bvh_prims
+
+def create_primitives(triangles):
+    num = int(triangles["vertex_1"].shape[0])
+    prims = []
+    for i in range(num):
+        prim = {
+            "v0": triangles["vertex_1"][i],
+            "v1": triangles["vertex_2"][i],
+            "v2": triangles["vertex_3"][i],
+            "centroid": triangles["centroid"][i],
+            "normal": triangles["normal"][i],
+            "edge_1": triangles["edge_1"][i],
+            "edge_2": triangles["edge_2"][i]
+        }
+        prims.append(prim)
+    return prims
+
 # ------------------------------------------------------------------
 # Example Usage
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     from io import load_obj, create_triangle_arrays
-    from time import time
 
     file_path = "path/to/your.obj"
     vertices, faces = load_obj(file_path)
     triangles = create_triangle_arrays(vertices, faces)
-    # Build primitives using your existing function.
     from accelerators.bvh import create_primitives, BVHNode
     primitives = create_primitives(triangles)
-    # Build bounded_boxes as a list of BVHPrimitive objects.
-    from accelerators.hlbvh import BVHPrimitive  # Ensure you import your BVHPrimitive class.
+    from accelerators.hlbvh import BVHPrimitive
     bounded_boxes = []
     N = len(triangles["vertex_1"])
     def compute_triangle_bounds(v1, v2, v3):
@@ -357,7 +406,8 @@ if __name__ == "__main__":
     print(bvh_root)
     print("Total nodes:", total_nodes[0])
     print("Ordered primitives count:", len(ordered_prims))
-    # Flatten the tree using the HLBVH flattening routine.
+    # Now flatten the tree.
+    from time import time
     start_t = time()
     linear_bvh_list = flatten_bvh(bvh_root)
     linear_bvh = pack_linear_bvh(linear_bvh_list)

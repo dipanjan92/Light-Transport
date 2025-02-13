@@ -5,19 +5,11 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="00bdb0cc-80fa-4f72-90e0-23f88b15da3a" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/accelerators/bvh_bkp.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/accelerators/bvh_bkp2.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/objects/cornellbox.obj" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/accelerators/hlbvh_bkp.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/hlbvh.ipynb" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/accelerators/bvh.py" beforeDir="false" afterPath="$PROJECT_DIR$/accelerators/bvh.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/accelerators/hlbvh.py" beforeDir="false" afterPath="$PROJECT_DIR$/accelerators/hlbvh.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/base/renderer.py" beforeDir="false" afterPath="$PROJECT_DIR$/base/renderer.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/primitives/aabb.py" beforeDir="false" afterPath="$PROJECT_DIR$/primitives/aabb.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/primitives/intersects.py" beforeDir="false" afterPath="$PROJECT_DIR$/primitives/intersects.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/primitives/triangle.py" beforeDir="false" afterPath="$PROJECT_DIR$/primitives/triangle.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/render.ipynb" beforeDir="false" afterPath="$PROJECT_DIR$/render.ipynb" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tests.ipynb" beforeDir="false" afterPath="$PROJECT_DIR$/tests.ipynb" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tests/test_bvh.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_bvh.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/utils/io.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/io.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -46,20 +38,20 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;WebServerToolWindowFactoryState&quot;: &quot;false&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
-    &quot;last_opened_file_path&quot;: &quot;/Users/dipanjan/PycharmProjects/light-transport-simulator/accelerators&quot;,
-    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
-    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
-    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
-    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable&quot;,
-    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "WebServerToolWindowFactoryState": "false",
+    "git-widget-placeholder": "main",
+    "last_opened_file_path": "/Users/dipanjan/PycharmProjects/light-transport-simulator/accelerators",
+    "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "settings.editor.selected.configurable": "com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable",
+    "vue.rearranger.settings.migration": "true"
   }
-}</component>
+}]]></component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
       <recent name="$PROJECT_DIR$/accelerators" />
@@ -78,7 +70,7 @@
       <workItem from="1739145448296" duration="13182000" />
       <workItem from="1739257171420" duration="63000" />
       <workItem from="1739257416960" duration="14466000" />
-      <workItem from="1739396075177" duration="4567000" />
+      <workItem from="1739396075177" duration="11960000" />
     </task>
     <servers />
   </component>

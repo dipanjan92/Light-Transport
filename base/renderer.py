@@ -128,4 +128,40 @@ def render(flattened_bvh: dict, ordered_prims: dict, camera: PerspectiveCamera,
     image = colors.reshape((camera.height, camera.width, 3))
     return image
 
+# -------------------------------
+# Example usage
+# -------------------------------
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+    from io import load_obj, create_triangle_arrays  # your I/O functions
 
+    # Load the OBJ file.
+    file_path = "path/to/your.obj"
+    vertices, faces = load_obj(file_path)
+    triangles = create_triangle_arrays(vertices, faces)
+
+    # Build primitives and the BVH.
+    from accelerators.bvh import create_primitives, create_bvh_primitives, build_bvh, flatten_bvh, pack_primitives, pack_linear_bvh
+
+    primitives = create_primitives(triangles)
+    bvh_primitives = create_bvh_primitives(triangles)
+    split_method = 0  # for example, using SAH
+    nodes, ordered_prims = build_bvh(primitives, bvh_primitives, 0, len(bvh_primitives), [], split_method)
+    packed_prims = pack_primitives(ordered_prims)
+    linear_bvh_list = flatten_bvh(nodes, 0)
+    linear_bvh = pack_linear_bvh(linear_bvh_list)
+
+    # Create a default camera.
+    width = 640
+    height = 480
+    fov = 45.0
+    camera = create_default_camera(triangles, width, height, fov)
+
+    # Render the image using the parallel batched renderer.
+    image = render(linear_bvh, packed_prims, camera, batch_size=1024)
+
+    # Display the image.
+    plt.imshow(image)
+    plt.title("Rendered Image (Parallel Batching)")
+    plt.axis("off")
+    plt.show()
